@@ -65,11 +65,28 @@ else:
 
     # ── Load metadata if provided ──
     meta = None
-    if meta_file is not None:
-        meta = pd.read_csv(meta_file)
-        meta_cols = {c.lower(): c for c in meta.columns}
-        sid = meta_cols.get("sample") or list(meta.columns)[0]
-        meta = meta.set_index(sid)
+if meta_file is not None:
+    meta = pd.read_csv(meta_file)
+    meta_cols = {c.lower(): c for c in meta.columns}
+
+    # identify sample column
+    sid_col = meta_cols.get("sample") or list(meta.columns)[0]
+
+    # clean sample IDs ([ID](url) -> ID)
+    meta["sample_clean"] = meta[sid_col].apply(clean_id)
+    meta = meta.set_index("sample_clean")
+
+    # normalise haplogroup column names
+    # support both mt_haplogroup / y_haplogroup and haplogroup_mt / haplogroup_y
+    if "haplogroup_mt" not in meta.columns:
+        col_mt = meta_cols.get("mt_haplogroup")
+        if col_mt:
+            meta.rename(columns={col_mt: "haplogroup_mt"}, inplace=True)
+
+    if "haplogroup_y" not in meta.columns:
+        col_y = meta_cols.get("y_haplogroup")
+        if col_y:
+            meta.rename(columns={col_y: "haplogroup_y"}, inplace=True)
 
     # ── Build graph ──
     G = nx.Graph()
