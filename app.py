@@ -16,7 +16,7 @@ ibd_file = st.sidebar.file_uploader(
 
 st.sidebar.header("Optional sample metadata")
 meta_file = st.sidebar.file_uploader(
-    "Metadata CSV (sample,haplogroup_mt,...)", type=["csv"], key="meta"
+    "Metadata CSV (sample,haplogroup_mt,mt_haplogroup,y_haplogroup,...)", type=["csv"], key="meta"
 )
 
 # ───────────────────────── Helpers ─────────────────────────
@@ -28,6 +28,21 @@ def clean_id(x: str) -> str:
     if s.startswith("[") and "](" in s:
         return s.split("[", 1)[1].split("]", 1)[0]
     return s
+
+
+def classify_relationship(total_cm: float) -> str:
+    """
+    Rough heuristic for relationship class based on total shared cM.
+    You can adjust thresholds for ancient DNA later.
+    """
+    if total_cm >= 2500:
+        return "1st degree (parent/child/sibling)"
+    elif total_cm >= 1800:
+        return "2nd degree"
+    elif total_cm >= 1000:
+        return "3rd degree"
+    else:
+        return "remote/uncertain"
 
 
 # ───────────────────────── Main logic ─────────────────────────
@@ -56,37 +71,39 @@ else:
     df["total_cM"] = pd.to_numeric(df[tot_col], errors="coerce")
     df = df.dropna(subset=["total_cM"]).copy()
 
+    # Classify relationship per pair
+    df["relationship_class"] = df["total_cM"].apply(classify_relationship)
+
     st.subheader("Pairwise IBD (input)")
     st.dataframe(
-        df[["sample1", "sample2", "total_cM"]]
+        df[["sample1", "sample2", "total_cM", "relationship_class"]]
         .sort_values("total_cM", ascending=False),
         use_container_width=True,
     )
 
     # ── Load metadata if provided ──
     meta = None
-if meta_file is not None:
-    meta = pd.read_csv(meta_file)
-    meta_cols = {c.lower(): c for c in meta.columns}
+    if meta_file is not None:
+        meta = pd.read_csv(meta_file)
+        meta_cols = {c.lower(): c for c in meta.columns}
 
-    # identify sample column
-    sid_col = meta_cols.get("sample") or list(meta.columns)[0]
+        # identify sample column
+        sid_col = meta_cols.get("sample") or list(meta.columns)[0]
 
-    # clean sample IDs ([ID](url) -> ID)
-    meta["sample_clean"] = meta[sid_col].apply(clean_id)
-    meta = meta.set_index("sample_clean")
+        # clean sample IDs ([ID](url) -> ID)
+        meta["sample_clean"] = meta[sid_col].apply(clean_id)
+        meta = meta.set_index("sample_clean")
 
-    # normalise haplogroup column names
-    # support both mt_haplogroup / y_haplogroup and haplogroup_mt / haplogroup_y
-    if "haplogroup_mt" not in meta.columns:
-        col_mt = meta_cols.get("mt_haplogroup")
-        if col_mt:
-            meta.rename(columns={col_mt: "haplogroup_mt"}, inplace=True)
+        # normalise haplogroup column names
+        if "haplogroup_mt" not in meta.columns:
+            col_mt = meta_cols.get("mt_haplogroup")
+            if col_mt:
+                meta.rename(columns={col_mt: "haplogroup_mt"}, inplace=True)
 
-    if "haplogroup_y" not in meta.columns:
-        col_y = meta_cols.get("y_haplogroup")
-        if col_y:
-            meta.rename(columns={col_y: "haplogroup_y"}, inplace=True)
+        if "haplogroup_y" not in meta.columns:
+            col_y = meta_cols.get("y_haplogroup")
+            if col_y:
+                meta.rename(columns={col_y: "haplogroup_y"}, inplace=True)
 
     # ── Build graph ──
     G = nx.Graph()
@@ -153,9 +170,59 @@ if meta_file is not None:
             mime="text/csv",
         )
 
+    # ───────────────────── Pairwise relationships per cluster ─────────────────────
+
+    st.subheader("Pairwise relationships (filtered)")
+
+    # slider de llindar per total_cM
+    min_cm = st.slider(
+        "Minimum total IBD (cM) to display",
+        min_value=float(df["total_cM"].min()),
+        max_value=float(df["total_cM"].max()),
+        value=float(1000.0),
+        step=50.0,
+    )
+
+    # filtres per cluster i per haplogrups compartits
+    only_cluster = df.copy()
+    if selected != "All":
+        nodes_sel = [n for n, c in cluster_map.items() if c == selected]
+        only_cluster = only_cluster[
+            only_cluster["sample1"].isin(nodes_sel)
+            & only_cluster["sample2"].isin(nodes_sel)
+        ]
+
+    only_cluster = only_cluster[only_cluster["total_cM"] >= min_cm].copy()
+
+    filter_shared_hg = False
+    if meta is not None:
+        filter_shared_hg = st.checkbox(
+            "Only pairs sharing a haplogroup (mt or Y) within this view"
+        )
+
+    if meta is not None and filter_shared_hg:
+        def shares_hg(row):
+            s1, s2 = row["sample1"], row["sample2"]
+            if s1 not in meta.index or s2 not in meta.index:
+                return False
+            mt1 = meta.loc[s1].get("haplogroup_mt", None)
+            mt2 = meta.loc[s2].get("haplogroup_mt", None)
+            y1 = meta.loc[s1].get("haplogroup_y", None)
+            y2 = meta.loc[s2].get("haplogroup_y", None)
+            shared_mt = pd.notna(mt1) and pd.notna(mt2) and mt1 == mt2
+            shared_y = pd.notna(y1) and pd.notna(y2) and y1 == y2
+            return shared_mt or shared_y
+
+        only_cluster = only_cluster[only_cluster.apply(shares_hg, axis=1)]
+
+    st.dataframe(
+        only_cluster[["sample1", "sample2", "total_cM", "relationship_class"]]
+        .sort_values("total_cM", ascending=False),
+        use_container_width=True,
+    )
+
     # ───────────────────── Network graph ─────────────────────
 
-    # Subgraph by cluster
     if selected != "All":
         nodes = [s for s in G.nodes() if cluster_map[s] == selected]
         H = G.subgraph(nodes)
@@ -167,7 +234,6 @@ if meta_file is not None:
     if H.number_of_nodes() == 0:
         st.warning("No nodes to display for this selection.")
     else:
-        # Layout
         pos = nx.spring_layout(H, weight="weight", seed=42)
 
         node_x, node_y, text_labels, hovertext = [], [], [], []
