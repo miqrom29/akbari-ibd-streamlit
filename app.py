@@ -21,20 +21,13 @@ meta_file = st.sidebar.file_uploader(
 
 # ───────────────────────── Helpers ─────────────────────────
 
-
 def clean_id(x: str) -> str:
-    """Convert '[ID](url)' → 'ID', otherwise return the string."""
     s = str(x)
     if s.startswith("[") and "](" in s:
         return s.split("[", 1)[1].split("]", 1)[0]
     return s
 
-
 def classify_relationship(total_cm: float) -> str:
-    """
-    Rough heuristic for relationship class based on total shared cM.
-    You can adjust thresholds for ancient DNA later.
-    """
     if total_cm >= 2500:
         return "1st degree (parent/child/sibling)"
     elif total_cm >= 1800:
@@ -43,7 +36,6 @@ def classify_relationship(total_cm: float) -> str:
         return "3rd degree"
     else:
         return "remote/uncertain"
-
 
 # ───────────────────────── Main logic ─────────────────────────
 
@@ -87,14 +79,10 @@ else:
         meta = pd.read_csv(meta_file)
         meta_cols = {c.lower(): c for c in meta.columns}
 
-        # identify sample column
         sid_col = meta_cols.get("sample") or list(meta.columns)[0]
-
-        # clean sample IDs ([ID](url) -> ID)
         meta["sample_clean"] = meta[sid_col].apply(clean_id)
         meta = meta.set_index("sample_clean")
 
-        # normalise haplogroup column names
         if "haplogroup_mt" not in meta.columns:
             col_mt = meta_cols.get("mt_haplogroup")
             if col_mt:
@@ -110,7 +98,6 @@ else:
     for _, r in df.iterrows():
         G.add_edge(r["sample1"], r["sample2"], weight=r["total_cM"])
 
-    # Connected components as clusters
     components = list(nx.connected_components(G))
     cluster_map = {}
     for i, comp in enumerate(components, start=1):
@@ -138,14 +125,78 @@ else:
     st.subheader("Sample assignments")
     st.dataframe(df_samples, use_container_width=True)
 
-    # ───────────────────── Cluster selector & favorites ─────────────────────
+    # ───────────────────── Cluster selector & search ─────────────────────
 
     if "favorites" not in st.session_state:
         st.session_state["favorites"] = set()
 
     st.sidebar.header("Cluster view")
+
     clusters = sorted(df_samples["cluster"].unique())
-    selected = st.sidebar.selectbox("Select cluster", ["All"] + clusters)
+
+    # 1) Cerca per sample ID
+    search_id = st.sidebar.text_input("Search sample ID (exact or partial)")
+
+    cluster_from_id = None
+    if search_id:
+        hits = df_samples[df_samples["sample"].str.contains(search_id, case=False, na=False)]
+        hit_clusters = sorted(hits["cluster"].unique())
+        if len(hit_clusters) == 1:
+            cluster_from_id = hit_clusters[0]
+        elif len(hit_clusters) > 1:
+            cluster_from_id = st.sidebar.selectbox(
+                "Multiple clusters match this ID, choose one",
+                hit_clusters,
+                key="cluster_from_id",
+            )
+        if len(hits):
+            st.sidebar.write(f"{len(hits)} samples matched this ID search.")
+        else:
+            st.sidebar.write("No samples matched this ID search.")
+
+    # 2) Cerca per haplogrup (mt o Y, si hi ha metadata)
+    search_haplo = None
+    cluster_from_hg = None
+    if meta is not None:
+        search_haplo = st.sidebar.text_input("Search haplogroup (mt or Y)")
+
+        if search_haplo:
+            cols_hg = [c for c in df_samples.columns if "haplogroup" in c.lower()]
+            if cols_hg:
+                mask = False
+                for c in cols_hg:
+                    mask = mask | df_samples[c].astype(str).str.contains(
+                        search_haplo, case=False, na=False
+                    )
+                hits_hg = df_samples[mask]
+                hit_clusters_hg = sorted(hits_hg["cluster"].unique())
+                if len(hit_clusters_hg) == 1:
+                    cluster_from_hg = hit_clusters_hg[0]
+                elif len(hit_clusters_hg) > 1:
+                    cluster_from_hg = st.sidebar.selectbox(
+                        "Multiple clusters match this haplogroup, choose one",
+                        hit_clusters_hg,
+                        key="cluster_from_hg",
+                    )
+                if len(hits_hg):
+                    st.sidebar.write(f"{len(hits_hg)} samples matched this haplogroup search.")
+                else:
+                    st.sidebar.write("No samples matched this haplogroup search.")
+
+    # 3) Selector normal de cluster, prioritzant cerques
+    default_cluster = "All"
+    if cluster_from_id:
+        default_cluster = cluster_from_id
+    elif cluster_from_hg:
+        default_cluster = cluster_from_hg
+
+    selected = st.sidebar.selectbox(
+        "Select cluster",
+        ["All"] + clusters,
+        index=(["All"] + clusters).index(default_cluster),
+    )
+
+    # ───────────────────── Favorites ─────────────────────
 
     col_fav_add, col_fav_clear = st.sidebar.columns(2)
     with col_fav_add:
@@ -174,7 +225,6 @@ else:
 
     st.subheader("Pairwise relationships (filtered)")
 
-    # slider de llindar per total_cM
     min_cm = st.slider(
         "Minimum total IBD (cM) to display",
         min_value=float(df["total_cM"].min()),
@@ -183,7 +233,6 @@ else:
         step=50.0,
     )
 
-    # filtres per cluster i per haplogrups compartits
     only_cluster = df.copy()
     if selected != "All":
         nodes_sel = [n for n, c in cluster_map.items() if c == selected]
