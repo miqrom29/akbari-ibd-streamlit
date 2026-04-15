@@ -2,10 +2,12 @@ import io
 import re
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import networkx as nx
 import plotly.graph_objects as go
+
 
 st.set_page_config(page_title="IBD Cluster Notes Demo", layout="wide")
 st.title("IBD Cluster Notes Demo")
@@ -15,10 +17,11 @@ st.caption("Production-safe mode: cluster summary first, graph only for selected
 # ───────────────────────── Helpers ─────────────────────────
 
 def clean_id(x) -> str:
-    s = str(x)
+    s = str(x).strip()
     if s.startswith("[") and "](" in s:
-        return s.split("[", 1)[1].split("]", 1)[0]
-    return s.strip()
+        s = s.split("[", 1)[1].split("]", 1)[0]
+    s = re.sub(r"\s+", "", s)
+    return s
 
 
 def classify_relationship(total_cm: float) -> str:
@@ -38,7 +41,7 @@ def make_note_line(row: pd.Series) -> str:
 
 
 def detect_separator(sample_bytes: bytes) -> str:
-    text = sample_bytes.decode("utf-8", errors="ignore")
+    text = sample_bytes[:20000].decode("utf-8", errors="ignore")
     if text.count("\t") > text.count(",") and text.count("\t") > text.count(";"):
         return "\t"
     if text.count(";") > text.count(","):
@@ -70,11 +73,54 @@ def norm_float(s) -> Optional[float]:
         return None
 
 
+def norm_col(c: str) -> str:
+    c = str(c).strip().replace("\ufeff", "")
+    c = c.lower()
+    c = re.sub(r"[\s\-/]+", "_", c)
+    return c
+
+
+def deduplicate_undirected_pairs(df: pd.DataFrame, keep: str = "max") -> pd.DataFrame:
+    x = df.copy()
+
+    x["sample1"] = x["sample1"].apply(clean_id)
+    x["sample2"] = x["sample2"].apply(clean_id)
+    x["total_cM"] = pd.to_numeric(x["total_cM"], errors="coerce")
+    x = x.dropna(subset=["sample1", "sample2", "total_cM"]).copy()
+    x = x[x["sample1"] != x["sample2"]].copy()
+
+    pair_sorted = pd.DataFrame(
+        np.sort(x[["sample1", "sample2"]].astype(str).values, axis=1),
+        columns=["sample1_canon", "sample2_canon"],
+        index=x.index,
+    )
+    x["sample1_canon"] = pair_sorted["sample1_canon"]
+    x["sample2_canon"] = pair_sorted["sample2_canon"]
+
+    group_cols = ["sample1_canon", "sample2_canon"]
+    agg = {"total_cM": "max" if keep == "max" else "sum"}
+
+    for extra in ["platform", "source_file", "relationship_class"]:
+        if extra in x.columns:
+            agg[extra] = "first"
+
+    out = (
+        x.groupby(group_cols, as_index=False)
+        .agg(agg)
+        .rename(columns={
+            "sample1_canon": "sample1",
+            "sample2_canon": "sample2",
+        })
+    )
+    return out
+
+
 # ───────────────────────── ancIBD block TSV parser ─────────────────────────
 
 def parse_ancibd_block_tsv(raw_bytes: bytes, source: str) -> pd.DataFrame:
     if raw_bytes.startswith(b"\xef\xbb\xbf"):
         raw_bytes = raw_bytes[3:]
+
     text = raw_bytes.decode("utf-8", errors="ignore")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
@@ -344,96 +390,102 @@ def build_pairs_from_classic(raw_bytes: bytes, filename: str) -> pd.DataFrame:
         dtype=str,
         on_bad_lines="skip",
         low_memory=False,
+        header=None,
     )
-    df.columns = [str(c).strip() for c in df.columns]
 
-    def norm_col(c: str) -> str:
-        c = str(c).strip().replace("\ufeff", "")
-        c = c.lower()
-        c = re.sub(r"[\s\-/]+", "_", c)
-        return c
+    # detect if file has header or not
+    first_row = df.iloc[0].astype(str).tolist()
+    first_row_norm = [norm_col(c) for c in first_row]
 
-    raw_cols = list(df.columns)
-
-    def find_first(predicates):
-        for raw in raw_cols:
-            n = norm_col(raw)
-            for p in predicates:
-                if p(n):
-                    return raw
-        return None
-
-    id1_col = find_first([
-        lambda n: n == "sample1",
-        lambda n: n == "id1",
-        lambda n: n == "kit1",
-        lambda n: n == "profile1",
-        lambda n: n == "person1",
-        lambda n: n == "individual1",
-        lambda n: n == "sample_1",
-        lambda n: n == "id_1",
-        lambda n: n.endswith("1") and any(k in n for k in ["sample", "id", "kit", "profile", "person", "individual"]),
+    looks_like_header = any(x in first_row_norm for x in [
+        "id1", "id2", "sample1", "sample2", "total_cm", "ibd_cm", "shared_cm", "cm"
     ])
 
-    id2_col = find_first([
-        lambda n: n == "sample2",
-        lambda n: n == "id2",
-        lambda n: n == "kit2",
-        lambda n: n == "profile2",
-        lambda n: n == "person2",
-        lambda n: n == "individual2",
-        lambda n: n == "sample_2",
-        lambda n: n == "id_2",
-        lambda n: n == "match",
-        lambda n: n == "match_name",
-        lambda n: n == "display_name",
-        lambda n: n.endswith("2") and any(k in n for k in ["sample", "id", "kit", "profile", "person", "individual"]),
-    ])
+    if looks_like_header:
+        df = pd.read_csv(
+            io.BytesIO(raw_bytes),
+            sep=sep,
+            dtype=str,
+            on_bad_lines="skip",
+            low_memory=False,
+        )
+        df.columns = [str(c).strip() for c in df.columns]
+        raw_cols = list(df.columns)
 
-    tot_col = find_first([
-        lambda n: n == "total_cm",
-        lambda n: n == "shared_cm",
-        lambda n: n == "ibd_cm",
-        lambda n: n == "shared_dna",
-        lambda n: n == "genetic_distance",
-        lambda n: n == "length_cm",
-        lambda n: n == "tot_cm",
-        lambda n: n == "cm",
-        lambda n: "ibd" in n and "cm" in n,
-        lambda n: "total" in n and "cm" in n,
-        lambda n: "shared" in n and "cm" in n,
-        lambda n: "shared" in n and "dna" in n,
-        lambda n: "genetic" in n and "distance" in n,
-    ])
+        def find_first(predicates):
+            for raw in raw_cols:
+                n = norm_col(raw)
+                for p in predicates:
+                    if p(n):
+                        return raw
+            return None
 
-    if id1_col is None and find_first([lambda n: n == "display_name"]) and find_first([lambda n: n == "percent_dna_shared"]):
-        name_col = find_first([lambda n: n == "display_name"])
-        pct_col = find_first([lambda n: n == "percent_dna_shared"])
+        id1_col = find_first([
+            lambda n: n == "sample1",
+            lambda n: n == "id1",
+            lambda n: n == "kit1",
+            lambda n: n == "profile1",
+            lambda n: n == "person1",
+            lambda n: n == "individual1",
+            lambda n: n == "sample_1",
+            lambda n: n == "id_1",
+            lambda n: n.endswith("1") and any(k in n for k in ["sample", "id", "kit", "profile", "person", "individual"]),
+        ])
 
-        def pct_to_cm(v):
-            f = norm_float(str(v).replace("%", ""))
-            return round(f * 71, 1) if f is not None else None
+        id2_col = find_first([
+            lambda n: n == "sample2",
+            lambda n: n == "id2",
+            lambda n: n == "kit2",
+            lambda n: n == "profile2",
+            lambda n: n == "person2",
+            lambda n: n == "individual2",
+            lambda n: n == "sample_2",
+            lambda n: n == "id_2",
+            lambda n: n == "match",
+            lambda n: n == "match_name",
+            lambda n: n == "display_name",
+            lambda n: n.endswith("2") and any(k in n for k in ["sample", "id", "kit", "profile", "person", "individual"]),
+        ])
+
+        tot_col = find_first([
+            lambda n: n == "total_cm",
+            lambda n: n == "shared_cm",
+            lambda n: n == "ibd_cm",
+            lambda n: n == "shared_dna",
+            lambda n: n == "genetic_distance",
+            lambda n: n == "length_cm",
+            lambda n: n == "tot_cm",
+            lambda n: n == "cm",
+            lambda n: "ibd" in n and "cm" in n,
+            lambda n: "total" in n and "cm" in n,
+            lambda n: "shared" in n and "cm" in n,
+            lambda n: "shared" in n and "dna" in n,
+            lambda n: "genetic" in n and "distance" in n,
+        ])
+
+        if id1_col is None or id2_col is None or tot_col is None:
+            raise ValueError(
+                "Unsupported classic pairs format. "
+                f"Columns found: {raw_cols}. "
+                f"Resolved id1={id1_col}, id2={id2_col}, total={tot_col}"
+            )
 
         out = pd.DataFrame({
-            "sample1": "FOCAL",
-            "sample2": df[name_col].apply(clean_id),
-            "total_cM": df[pct_col].apply(pct_to_cm),
+            "sample1": df[id1_col].apply(clean_id),
+            "sample2": df[id2_col].apply(clean_id),
+            "total_cM": df[tot_col].apply(norm_float),
         }).dropna(subset=["total_cM"]).copy()
         return out
 
-    if id1_col is None or id2_col is None or tot_col is None:
-        raise ValueError(
-            "Unsupported classic pairs format. "
-            f"Columns found: {raw_cols}. "
-            f"Resolved id1={id1_col}, id2={id2_col}, total={tot_col}"
-        )
+    # headerless fallback: first 3 columns = id1,id2,total
+    if df.shape[1] < 3:
+        raise ValueError("Classic pairs file needs at least 3 columns.")
 
     out = pd.DataFrame({
-        "sample1": df[id1_col].apply(clean_id),
-        "sample2": df[id2_col].apply(clean_id),
-        "total_cM": df[tot_col].apply(norm_float),
+        "sample1": df.iloc[:, 0].apply(clean_id),
+        "sample2": df.iloc[:, 1].apply(clean_id),
+        "total_cM": df.iloc[:, 2].apply(norm_float),
     }).dropna(subset=["total_cM"]).copy()
-
     return out
 
 
@@ -534,10 +586,12 @@ meta_file = st.sidebar.file_uploader(
     key="meta",
 )
 
+
 def norm_meta_col(c: str) -> str:
     c = str(c).strip().replace("\ufeff", "")
     c = re.sub(r"\s+", " ", c)
     return c.lower()
+
 
 meta = None
 if meta_file is not None:
@@ -612,8 +666,13 @@ if meta_file is not None:
     )
     meta.columns = [str(c).strip() for c in meta.columns]
 
-    meta["sample_clean"] = meta[sid_col].apply(clean_id)
-    meta = meta.set_index("sample_clean")
+    meta["sample_clean"] = (
+        meta[sid_col]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", "", regex=True)
+        .apply(clean_id)
+    )
 
     if mt_col is not None and mt_col in meta.columns:
         meta.rename(columns={mt_col: "haplogroup_mt"}, inplace=True)
@@ -625,7 +684,20 @@ if meta_file is not None:
     else:
         meta["haplogroup_y"] = pd.NA
 
+    meta["haplogroup_mt"] = meta["haplogroup_mt"].astype(str).replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+    meta["haplogroup_y"] = meta["haplogroup_y"].astype(str).replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+
+    meta = (
+        meta[["sample_clean", "haplogroup_mt", "haplogroup_y"]]
+        .dropna(subset=["sample_clean"])
+        .drop_duplicates(subset=["sample_clean"], keep="first")
+        .set_index("sample_clean")
+    )
+
     st.sidebar.caption(f"Metadata columns detected: ID={sid_col} | mt={mt_col} | Y={y_col}")
+    st.sidebar.caption(f"Metadata rows loaded: {len(meta):,}")
+    st.sidebar.caption(f"mt non-null: {meta['haplogroup_mt'].notna().sum():,} | Y non-null: {meta['haplogroup_y'].notna().sum():,}")
+
 
 # ───────────────────────── Data loading ─────────────────────────
 
@@ -641,14 +713,13 @@ if input_mode == "ancIBD block TSV (no header)":
 
     raw = anc_file.getvalue()
     df = build_pairs_from_ancibd(raw, anc_file.name)
-    st.info(f"Parsed {len(df):,} ancIBD pairs from file.")
+    df = deduplicate_undirected_pairs(df, keep="max")
+    st.info(f"Parsed {len(df):,} ancIBD pairs from file after deduplication.")
 
     if df.empty:
         st.error("No pairs could be extracted. Check the file format.")
         st.stop()
 
-    df["sample1"] = df["sample1"].apply(clean_id)
-    df["sample2"] = df["sample2"].apply(clean_id)
     source_label = f"ancIBD block TSV ({anc_file.name})"
 
     with st.expander("Parsed pairs preview", expanded=False):
@@ -661,9 +732,11 @@ elif input_mode == "Classic IBD pairs CSV/TSV":
         st.stop()
 
     raw = ibd_file.getvalue()
-
     try:
         df = build_pairs_from_classic(raw, ibd_file.name)
+        n_before = len(df)
+        df = deduplicate_undirected_pairs(df, keep="max")
+        st.caption(f"Deduplicated undirected pairs: {n_before:,} -> {len(df):,}")
     except Exception as e:
         st.error(str(e))
         st.stop()
@@ -691,6 +764,10 @@ else:
     if df is None or df.empty:
         st.warning("No pairwise matches could be extracted.")
         st.stop()
+
+    n_before = len(df)
+    df = deduplicate_undirected_pairs(df, keep="max")
+    st.caption(f"Deduplicated undirected pairs: {n_before:,} -> {len(df):,}")
 
     source_label = "Unified genealogy loader"
     st.download_button(
@@ -739,6 +816,8 @@ if build_df.empty:
 with st.spinner("Building graph and cluster summary..."):
     G, cluster_map, cluster_sizes = build_graph_objects(build_df[["sample1", "sample2", "total_cM"]])
 
+meta_lookup = meta.to_dict(orient="index") if meta is not None else {}
+
 rows = []
 for node in G.nodes():
     partners = list(G.neighbors(node))
@@ -749,9 +828,10 @@ for node in G.nodes():
         "partners": len(partners),
         "max_pairwise_cM": max(totals) if totals else 0.0,
     }
-    if meta is not None and node in meta.index:
-        for col in meta.columns:
-            row[col] = meta.loc[node, col]
+    m = meta_lookup.get(clean_id(node))
+    if m is not None:
+        row["haplogroup_mt"] = m.get("haplogroup_mt")
+        row["haplogroup_y"] = m.get("haplogroup_y")
     rows.append(row)
 
 df_samples = pd.DataFrame(rows).sort_values(["cluster", "sample"])
@@ -759,6 +839,10 @@ cluster_summary = build_cluster_summary(build_df[["sample1", "sample2", "total_c
 
 st.subheader("Cluster summary")
 st.dataframe(cluster_summary.head(500), width="stretch", height=260)
+
+if meta is not None and not df_samples.empty:
+    matched = df_samples["sample"].astype(str).apply(clean_id).isin(meta.index).sum()
+    st.caption(f"Metadata matched to {matched} / {len(df_samples)} samples in current graph")
 
 
 # ───────────────────────── Sidebar cluster controls ─────────────────────────
@@ -936,11 +1020,12 @@ with right:
                 node_y.append(py)
                 text_labels.append(n)
                 label = n
-                if meta is not None and n in meta.index:
-                    if "haplogroup_mt" in meta.columns:
-                        label += f" | mt: {meta.loc[n, 'haplogroup_mt']}"
-                    if "haplogroup_y" in meta.columns:
-                        label += f" | Y: {meta.loc[n, 'haplogroup_y']}"
+                m = meta_lookup.get(clean_id(n))
+                if m is not None:
+                    if m.get("haplogroup_mt") is not None and pd.notna(m.get("haplogroup_mt")):
+                        label += f" | mt: {m.get('haplogroup_mt')}"
+                    if m.get("haplogroup_y") is not None and pd.notna(m.get("haplogroup_y")):
+                        label += f" | Y: {m.get('haplogroup_y')}"
                 hovertext.append(label)
 
             edge_x, edge_y = [], []
