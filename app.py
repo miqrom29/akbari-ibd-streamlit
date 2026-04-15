@@ -1,6 +1,6 @@
 import io
 import re
-from typing import List, Tuple, Optional
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -9,7 +9,8 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="IBD Cluster Notes Demo", layout="wide")
 st.title("IBD Cluster Notes Demo")
-st.caption("Supports: ancIBD block TSV · Classic pairs CSV/TSV · FTDNA · MyHeritage · 23andMe · Geneanet · 529andYou")
+st.caption("Production-safe mode: cluster summary first, graph only for selected cluster")
+
 
 # ───────────────────────── Helpers ─────────────────────────
 
@@ -19,16 +20,22 @@ def clean_id(x) -> str:
         return s.split("[", 1)[1].split("]", 1)[0]
     return s.strip()
 
+
 def classify_relationship(total_cm: float) -> str:
-    if total_cm >= 2500: return "1st degree"
-    elif total_cm >= 1800: return "2nd degree"
-    elif total_cm >= 1000: return "3rd degree"
+    if total_cm >= 2500:
+        return "1st degree"
+    elif total_cm >= 1800:
+        return "2nd degree"
+    elif total_cm >= 1000:
+        return "3rd degree"
     return "remote/uncertain"
+
 
 def make_note_line(row: pd.Series) -> str:
     mt = row.get("haplogroup_mt", "NA")
-    y  = row.get("haplogroup_y",  "NA")
+    y = row.get("haplogroup_y", "NA")
     return f"{row['sample']} | mt={mt} | Y={y} | {row['cluster']}"
+
 
 def detect_separator(sample_bytes: bytes) -> str:
     text = sample_bytes.decode("utf-8", errors="ignore")
@@ -38,500 +45,941 @@ def detect_separator(sample_bytes: bytes) -> str:
         return ";"
     return ","
 
+
 def norm_float(s) -> Optional[float]:
-    if s is None: return None
-    if isinstance(s, (float, int)): return float(s)
-    s = str(s).strip().replace("\u200e","").replace(" ","")
+    if s is None:
+        return None
+    if isinstance(s, (float, int)):
+        return float(s)
+    s = str(s).strip().replace("\u200e", "").replace(" ", "")
     s = s.strip('"').strip("'")
     m = re.search(r"([\d,\.]+)\s*cM", s, re.IGNORECASE)
-    if m: s = m.group(1)
-    s = s.replace("%","")
+    if m:
+        s = m.group(1)
+    s = s.replace("%", "")
     if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."): s = s.replace(".", "").replace(",",".")
-        else: s = s.replace(",","")
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
     elif "," in s:
-        s = s.replace(",",".")
-    try: return float(s)
-    except ValueError: return None
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-# ───────────────────────── ancIBD block TSV ─────────────────────────
 
-def is_ancibd_block_format(raw_bytes: bytes) -> bool:
-    """Detect headerless block TSV: unindented focal line + tab-indented match lines, no CSV structure."""
-    text = raw_bytes.decode("utf-8", errors="ignore")
-    lines = [l for l in text.splitlines() if l.strip()]
-    if len(lines) < 2:
-        return False
-    has_unindented = any(not l.startswith("\t") and not l.startswith(" ") for l in lines)
-    has_indented   = any(l.startswith("\t") or l.startswith(" ") for l in lines)
-    # Reject if first line looks like a CSV/TSV header with delimiters
-    first = lines[0]
-    has_csv = ("," in first or ";" in first)
-    # Reject if first indented line has >2 tab-separated fields (standard TSV with header)
-    indented_lines = [l for l in lines if l.startswith("\t") or l.startswith(" ")]
-    if indented_lines:
-        sample_fields = len(indented_lines[0].strip().split("\t"))
-        if sample_fields > 3:
-            return False
-    return has_unindented and has_indented and not has_csv
+# ───────────────────────── ancIBD block TSV parser ─────────────────────────
 
 def parse_ancibd_block_tsv(raw_bytes: bytes, source: str) -> pd.DataFrame:
-    """
-    Parse ancIBD-style block TSV (no header).
-    Unindented line = focal sample ID.
-    Tab-prefixed lines = \\tmatch_id\\tcM
-    Supports multiple blocks (multiple focal samples) in one file.
-    """
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
     text = raw_bytes.decode("utf-8", errors="ignore")
-    lines = text.splitlines()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+
     pairs = []
     current_focal = None
-    for line in lines:
+
+    for raw_line in lines:
+        if raw_line is None:
+            continue
+        line = raw_line.rstrip("\n")
         if not line.strip():
             continue
-        if line.startswith("\t") or line.startswith(" "):
-            parts = line.strip().split()
-            if current_focal and len(parts) >= 2:
+
+        if raw_line[:1].isspace():
+            if current_focal is None:
+                continue
+            stripped = line.strip()
+            parts = [p for p in stripped.split("\t") if p != ""] if "\t" in stripped else stripped.split()
+            if len(parts) < 2:
+                continue
+
+            match_id = parts[0].strip()
+            cm = None
+            for tok in parts[1:]:
+                tok2 = tok.strip().replace(",", ".")
                 try:
-                    cm = float(parts[1])
-                    pairs.append({
-                        "sample1": current_focal,
-                        "sample2": parts[0],
-                        "total_cM": cm,
-                        "source_file": source,
-                        "platform": "ancIBD block TSV",
-                    })
+                    cm = float(tok2)
+                    break
                 except ValueError:
                     continue
+
+            if cm is None:
+                continue
+
+            pairs.append({
+                "sample1": current_focal,
+                "sample2": match_id,
+                "total_cM": cm,
+                "source_file": source,
+                "platform": "ancIBD block TSV",
+            })
         else:
-            current_focal = line.strip()
-    return pd.DataFrame(pairs)
+            focal = line.strip().split("\t")[0].split()[0]
+            if focal:
+                current_focal = focal
+
+    return pd.DataFrame(
+        pairs,
+        columns=["sample1", "sample2", "total_cM", "source_file", "platform"]
+    )
+
 
 # ───────────────────────── Multi-CSV parsers ─────────────────────────
 
 def _empty_segs() -> pd.DataFrame:
-    return pd.DataFrame(columns=["id1","id2","chrom","start","end","cM","snps","platform","source_file"])
+    return pd.DataFrame(
+        columns=["id1", "id2", "chrom", "start", "end", "cM", "snps", "platform", "source_file"]
+    )
+
 
 def parse_529_segments(df, source):
-    df2 = df.rename(columns={"Name":"id1","Match name":"id2","Chromosome":"chrom",
-        "Start point":"start","End point":"end","Genetic distance":"cM","# SNPs":"snps"})
+    df2 = df.rename(columns={
+        "Name": "id1",
+        "Match name": "id2",
+        "Chromosome": "chrom",
+        "Start point": "start",
+        "End point": "end",
+        "Genetic distance": "cM",
+        "# SNPs": "snps",
+    })
     df2["cM"] = df2["cM"].apply(norm_float)
-    df2["platform"] = "529andYou"; df2["source_file"] = source
-    pairs = df2.groupby(["id1","id2"],as_index=False)["cM"].sum().rename(columns={"cM":"total_cM"})
-    pairs["platform"] = "529andYou"; pairs["source_file"] = source
-    return pairs, df2[["id1","id2","chrom","start","end","cM","snps","platform","source_file"]]
+    df2["platform"] = "529andYou"
+    df2["source_file"] = source
+    pairs = df2.groupby(["id1", "id2"], as_index=False)["cM"].sum().rename(columns={"cM": "total_cM"})
+    pairs["platform"] = "529andYou"
+    pairs["source_file"] = source
+    return pairs, df2[["id1", "id2", "chrom", "start", "end", "cM", "snps", "platform", "source_file"]]
+
 
 def parse_geneanet_segments(df, source):
-    df2 = df.rename(columns={"Public name":"id2",
-        "Username of the member who has uploaded the DNA data":"id1",
-        "Chromosome":"chrom","Start of segment":"start","Length of segment":"end",
-        "Number of SNPs":"snps","Length in centimorgan (cM)":"cM","Type of segment":"segment_type"})
+    df2 = df.rename(columns={
+        "Public name": "id2",
+        "Username of the member who has uploaded the DNA data": "id1",
+        "Chromosome": "chrom",
+        "Start of segment": "start",
+        "Length of segment": "end",
+        "Number of SNPs": "snps",
+        "Length in centimorgan (cM)": "cM",
+    })
     df2["cM"] = df2["cM"].apply(norm_float)
-    df2["platform"] = "Geneanet"; df2["source_file"] = source
-    pairs = df2.groupby(["id1","id2"],as_index=False)["cM"].sum().rename(columns={"cM":"total_cM"})
-    pairs["platform"] = "Geneanet"; pairs["source_file"] = source
-    return pairs, df2[["id1","id2","chrom","start","end","cM","snps","platform","source_file"]]
+    df2["platform"] = "Geneanet"
+    df2["source_file"] = source
+    pairs = df2.groupby(["id1", "id2"], as_index=False)["cM"].sum().rename(columns={"cM": "total_cM"})
+    pairs["platform"] = "Geneanet"
+    pairs["source_file"] = source
+    return pairs, df2[["id1", "id2", "chrom", "start", "end", "cM", "snps", "platform", "source_file"]]
+
 
 def parse_myheritage_matches(df, source, focal):
-    cols_map = {c.lower().strip():c for c in df.columns}
+    cols_map = {c.lower().strip(): c for c in df.columns}
     name_col = cols_map.get("nom") or cols_map.get("name")
-    total_cm_col = next((c for c in df.columns if "total de cm" in c.lower()
-                         or "total of shared" in c.lower() or "shared dna" in c.lower()),None)
+    total_cm_col = next(
+        (c for c in df.columns if "total de cm" in c.lower() or "total of shared" in c.lower() or "shared dna" in c.lower()),
+        None,
+    )
     if name_col is None or total_cm_col is None:
-        return pd.DataFrame(columns=["id1","id2","total_cM"]), _empty_segs()
-    df2 = df[[name_col,total_cm_col]].copy()
+        return pd.DataFrame(columns=["id1", "id2", "total_cM"]), _empty_segs()
+
+    df2 = df[[name_col, total_cm_col]].copy()
     df2["total_cM"] = df2[total_cm_col].apply(norm_float)
-    df2["id1"] = focal; df2.rename(columns={name_col:"id2"},inplace=True)
-    df2["platform"] = "MyHeritage"; df2["source_file"] = source
-    return df2[["id1","id2","total_cM","platform","source_file"]].dropna(subset=["total_cM"]), _empty_segs()
+    df2["id1"] = focal
+    df2.rename(columns={name_col: "id2"}, inplace=True)
+    df2["platform"] = "MyHeritage"
+    df2["source_file"] = source
+    return df2[["id1", "id2", "total_cM", "platform", "source_file"]].dropna(subset=["total_cM"]), _empty_segs()
+
 
 def parse_myheritage_autocluster(df, source):
-    cols_lower = {c.lower().strip():c for c in df.columns}
+    cols_lower = {c.lower().strip(): c for c in df.columns}
     name_col = cols_lower.get("name")
-    cm_col = next((c for c in df.columns if "total" in c.lower() and "cm" in c.lower()),None)
+    cm_col = next((c for c in df.columns if "total" in c.lower() and "cm" in c.lower()), None)
     if name_col is None or cm_col is None:
-        return pd.DataFrame(columns=["id1","id2","total_cM"]), _empty_segs()
-    pairs_list = []
+        return pd.DataFrame(columns=["id1", "id2", "total_cM"]), _empty_segs()
+
+    rows = []
     for _, row in df.iterrows():
         cm = norm_float(row[cm_col])
-        if cm is None: continue
-        pairs_list.append({"id1":str(row[name_col]).strip(),"id2":"FOCAL",
-                            "total_cM":cm,"platform":"MyHeritage AutoCluster","source_file":source})
-    return pd.DataFrame(pairs_list), _empty_segs()
+        if cm is None:
+            continue
+        rows.append({
+            "id1": str(row[name_col]).strip(),
+            "id2": "FOCAL",
+            "total_cM": cm,
+            "platform": "MyHeritage AutoCluster",
+            "source_file": source,
+        })
+    return pd.DataFrame(rows), _empty_segs()
+
 
 def parse_ftdna_matches(df, source, focal):
-    cols_lower = {c.lower().strip():c for c in df.columns}
+    cols_lower = {c.lower().strip(): c for c in df.columns}
     name_col = cols_lower.get("full name")
     if name_col is None:
-        fn = cols_lower.get("first name"); ln = cols_lower.get("last name")
+        fn = cols_lower.get("first name")
+        ln = cols_lower.get("last name")
         if fn and ln:
-            df["_full_name"] = df[fn].astype(str).str.strip()+" "+df[ln].astype(str).str.strip()
+            df["_full_name"] = df[fn].astype(str).str.strip() + " " + df[ln].astype(str).str.strip()
             name_col = "_full_name"
+
     cm_col = cols_lower.get("shared dna")
     if name_col is None or cm_col is None:
-        return pd.DataFrame(columns=["id1","id2","total_cM"]), _empty_segs()
-    df2 = df[[name_col,cm_col]].copy()
+        return pd.DataFrame(columns=["id1", "id2", "total_cM"]), _empty_segs()
+
+    df2 = df[[name_col, cm_col]].copy()
     df2["total_cM"] = df2[cm_col].apply(norm_float)
-    df2["id1"] = focal; df2.rename(columns={name_col:"id2"},inplace=True)
+    df2["id1"] = focal
+    df2.rename(columns={name_col: "id2"}, inplace=True)
     df2["id2"] = df2["id2"].astype(str).str.strip()
-    df2["platform"] = "FTDNA"; df2["source_file"] = source
-    return df2[["id1","id2","total_cM","platform","source_file"]].dropna(subset=["total_cM"]), _empty_segs()
+    df2["platform"] = "FTDNA"
+    df2["source_file"] = source
+    return df2[["id1", "id2", "total_cM", "platform", "source_file"]].dropna(subset=["total_cM"]), _empty_segs()
+
 
 def parse_23andme_relatives(df, source, focal):
-    cols_lower = {c.lower().strip():c for c in df.columns}
+    cols_lower = {c.lower().strip(): c for c in df.columns}
     name_col = cols_lower.get("display name")
     if name_col is None:
-        return pd.DataFrame(columns=["id1","id2","total_cM"]), _empty_segs()
+        return pd.DataFrame(columns=["id1", "id2", "total_cM"]), _empty_segs()
+
     if "chromosome number" in cols_lower:
         chrom_col = cols_lower["chromosome number"]
         start_col = cols_lower.get("chromosome start point")
-        end_col   = cols_lower.get("chromosome end point")
-        cm_col    = cols_lower.get("genetic distance")
-        snp_col   = cols_lower.get("# snps")
+        end_col = cols_lower.get("chromosome end point")
+        cm_col = cols_lower.get("genetic distance")
+        snp_col = cols_lower.get("# snps")
+
         df2 = df.copy()
         df2["cM"] = df2[cm_col].apply(norm_float) if cm_col else None
-        df2["id1"] = focal; df2.rename(columns={name_col:"id2"},inplace=True)
+        df2["id1"] = focal
+        df2.rename(columns={name_col: "id2"}, inplace=True)
         df2["id2"] = df2["id2"].astype(str).str.strip()
-        df2["platform"] = "23andMe"; df2["source_file"] = source
-        df2["chrom"] = df2.get(chrom_col,None); df2["start"] = df2.get(start_col,None)
-        df2["end"] = df2.get(end_col,None);     df2["snps"]  = df2.get(snp_col,None)
-        segs  = df2[["id1","id2","chrom","start","end","cM","snps","platform","source_file"]].dropna(subset=["cM"])
-        pairs = df2.groupby(["id1","id2"],as_index=False)["cM"].sum().rename(columns={"cM":"total_cM"})
-        pairs["platform"] = "23andMe"; pairs["source_file"] = source
+        df2["platform"] = "23andMe"
+        df2["source_file"] = source
+        df2["chrom"] = df2.get(chrom_col, None)
+        df2["start"] = df2.get(start_col, None)
+        df2["end"] = df2.get(end_col, None)
+        df2["snps"] = df2.get(snp_col, None)
+
+        segs = df2[["id1", "id2", "chrom", "start", "end", "cM", "snps", "platform", "source_file"]].dropna(subset=["cM"])
+        pairs = df2.groupby(["id1", "id2"], as_index=False)["cM"].sum().rename(columns={"cM": "total_cM"})
+        pairs["platform"] = "23andMe"
+        pairs["source_file"] = source
         return pairs, segs
+
     pct_col = cols_lower.get("percent dna shared")
     if pct_col:
         def pct_to_cm(v):
-            f = norm_float(str(v).replace("%",""))
-            return round(f*71,1) if f is not None else None
-        df2 = df[[name_col,pct_col]].copy()
+            f = norm_float(str(v).replace("%", ""))
+            return round(f * 71, 1) if f is not None else None
+
+        df2 = df[[name_col, pct_col]].copy()
         df2["total_cM"] = df2[pct_col].apply(pct_to_cm)
-        df2["id1"] = focal; df2.rename(columns={name_col:"id2"},inplace=True)
+        df2["id1"] = focal
+        df2.rename(columns={name_col: "id2"}, inplace=True)
         df2["id2"] = df2["id2"].astype(str).str.strip()
-        df2["platform"] = "23andMe (~)"; df2["source_file"] = source
-        return df2[["id1","id2","total_cM","platform","source_file"]].dropna(subset=["total_cM"]), _empty_segs()
-    return pd.DataFrame(columns=["id1","id2","total_cM"]), _empty_segs()
+        df2["platform"] = "23andMe (~)"
+        df2["source_file"] = source
+        return df2[["id1", "id2", "total_cM", "platform", "source_file"]].dropna(subset=["total_cM"]), _empty_segs()
+
+    return pd.DataFrame(columns=["id1", "id2", "total_cM"]), _empty_segs()
+
 
 def detect_and_parse(file, focal_sample):
     raw_bytes = file.getvalue()
     sep = detect_separator(raw_bytes)
     try:
         df = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, dtype=str, on_bad_lines="skip")
+        df.columns = [str(c).strip() for c in df.columns]
     except Exception:
         df = pd.DataFrame()
+
     cols_set = set(c.lower().strip() for c in df.columns) if not df.empty else set()
+
     if "name" in cols_set and "match name" in cols_set and "genetic distance" in cols_set:
-        p,s = parse_529_segments(df, file.name); return p,s,"529andYou (segments)"
+        p, s = parse_529_segments(df, file.name)
+        return p, s, "529andYou (segments)"
+
     if "public name" in cols_set and any("centimorgan" in c.lower() for c in df.columns):
-        p,s = parse_geneanet_segments(df, file.name); return p,s,"Geneanet (segments)"
+        p, s = parse_geneanet_segments(df, file.name)
+        return p, s, "Geneanet (segments)"
+
     autocluster_cols = [c for c in df.columns if re.match(r"^\d+_", c.strip())]
     if len(autocluster_cols) >= 5:
-        p,s = parse_myheritage_autocluster(df, file.name); return p,s,"MyHeritage AutoCluster"
-    if any("total de cm" in c.lower() or "total of shared" in c.lower() or "shared dna" in c.lower()
-           for c in df.columns) and any("nom" in c.lower() or "name" in c.lower() for c in df.columns) \
-       and "full name" not in cols_set:
-        p,s = parse_myheritage_matches(df, file.name, focal_sample); return p,s,"MyHeritage (matches)"
+        p, s = parse_myheritage_autocluster(df, file.name)
+        return p, s, "MyHeritage AutoCluster"
+
+    if any("total de cm" in c.lower() or "total of shared" in c.lower() or "shared dna" in c.lower() for c in df.columns) and any("nom" in c.lower() or "name" in c.lower() for c in df.columns) and "full name" not in cols_set:
+        p, s = parse_myheritage_matches(df, file.name, focal_sample)
+        return p, s, "MyHeritage (matches)"
+
     if "shared dna" in cols_set and ("full name" in cols_set or ("first name" in cols_set and "last name" in cols_set)):
-        p,s = parse_ftdna_matches(df, file.name, focal_sample); return p,s,"FTDNA (matches)"
+        p, s = parse_ftdna_matches(df, file.name, focal_sample)
+        return p, s, "FTDNA (matches)"
+
     if "display name" in cols_set:
-        p,s = parse_23andme_relatives(df, file.name, focal_sample); return p,s,"23andMe (relatives)"
-    return pd.DataFrame(columns=["id1","id2","total_cM","platform","source_file"]), _empty_segs(), "Unknown/unsupported (yet)"
+        p, s = parse_23andme_relatives(df, file.name, focal_sample)
+        return p, s, "23andMe (relatives)"
 
-# ───────────────────────── Session state ─────────────────────────
+    return pd.DataFrame(columns=["id1", "id2", "total_cM", "platform", "source_file"]), _empty_segs(), "Unknown/unsupported (yet)"
 
-for k,v in [("favorites",set()),("pedigree_notes","")]:
-    if k not in st.session_state:
-        st.session_state[k] = v
 
-# ───────────────────────── Sidebar ─────────────────────────
+# ───────────────────────── Cached builders ─────────────────────────
 
-st.sidebar.header("Input mode")
-input_mode = st.sidebar.radio("Choose input source", [
-    "ancIBD block TSV (no header)",
-    "Classic IBD pairs CSV/TSV",
-    "Multi-CSV genealogy loader",
-])
+@st.cache_data(show_spinner=False)
+def build_pairs_from_ancibd(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    return parse_ancibd_block_tsv(raw_bytes, filename)
 
-st.sidebar.header("Optional sample metadata")
-meta_file = st.sidebar.file_uploader("Metadata CSV (sample,haplogroup_mt,...)", type=["csv"], key="meta")
-meta = None
-if meta_file is not None:
-    meta = pd.read_csv(meta_file)
-    meta_cols = {c.lower():c for c in meta.columns}
-    sid_col = meta_cols.get("sample") or list(meta.columns)[0]
-    meta["sample_clean"] = meta[sid_col].apply(clean_id)
-    meta = meta.set_index("sample_clean")
-    if "haplogroup_mt" not in meta.columns:
-        col_mt = meta_cols.get("mt_haplogroup")
-        if col_mt: meta.rename(columns={col_mt:"haplogroup_mt"},inplace=True)
-    if "haplogroup_y" not in meta.columns:
-        col_y = meta_cols.get("y_haplogroup")
-        if col_y: meta.rename(columns={col_y:"haplogroup_y"},inplace=True)
 
-# ───────────────────────── Load data ─────────────────────────
+@st.cache_data(show_spinner=False)
+def build_pairs_from_classic(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    sep = "\t" if filename.lower().endswith(".tsv") else detect_separator(raw_bytes)
 
-df = None
-segments_df = None
-
-if input_mode == "ancIBD block TSV (no header)":
-    st.sidebar.header("Upload ancIBD block TSV")
-    anc_file = st.sidebar.file_uploader(
-        "Block text file (.txt or .csv): unindented focal ID + tab-indented match\\tcM lines",
-        key="ancibd"
+    df = pd.read_csv(
+        io.BytesIO(raw_bytes),
+        sep=sep,
+        dtype=str,
+        on_bad_lines="skip",
+        low_memory=False,
     )
-    if anc_file is None:
-        st.info("📂 Upload your ancIBD block file (.tsv, .txt or any text file) to begin.\n\n"
-                "**Format (no header):**\n```\nFocalSample\n\tMatch1\t2171.90\n\tMatch2\t31.11\n```\n"
-                "Multiple focal sample blocks in the same file are supported.")
-        st.stop()
-    raw = anc_file.getvalue()
+    df.columns = [str(c).strip() for c in df.columns]
 
-    fmt_ok = is_ancibd_block_format(raw)
-    if not fmt_ok:
-        st.warning("⚠️ Auto-detection failed — attempting to parse anyway. "
-                   "Check the raw preview above: focal lines must have NO leading tab/space; "
-                   "match lines must start with a TAB character (\\t).")
-    df = parse_ancibd_block_tsv(raw, anc_file.name)
-    st.info(f"Parsed {len(df):,} ancIBD pairs from file.")
-    if df.empty:
-        st.error("No pairs could be extracted. Check the file format.")
-        st.stop()
-    df["sample1"] = df["sample1"].apply(clean_id)
-    df["sample2"] = df["sample2"].apply(clean_id)
-    source_label = f"ancIBD block TSV ({anc_file.name})"
+    def norm_col(c: str) -> str:
+        c = str(c).strip().replace("\ufeff", "")
+        c = c.lower()
+        c = re.sub(r"[\s\-/]+", "_", c)
+        return c
 
-    # Preview raw parse
-    with st.expander("Raw parsed pairs (ancIBD)", expanded=False):
-        st.dataframe(df.head(200), width='stretch', height=200)
-    st.download_button("Download normalized pairs CSV",
-        df[["sample1","sample2","total_cM"]].to_csv(index=False).encode("utf-8"),
-        file_name="ancibd_pairs_normalized.csv", mime="text/csv")
+    raw_cols = list(df.columns)
 
-elif input_mode == "Classic IBD pairs CSV/TSV":
-    st.sidebar.header("Upload IBD pairs")
-    ibd_file = st.sidebar.file_uploader("CSV or TSV with id1,id2,total_cM", key="ibd")
-    if ibd_file is None:
-        st.info("Upload a CSV/TSV file with id1,id2,total_cM to begin.")
-        st.stop()
-    sep = "\t" if ibd_file.name.endswith(".tsv") else ","
-    df = pd.read_csv(ibd_file, sep=sep)
-    cols = {c.lower():c for c in df.columns}
-    id1_col = cols.get("sample1") or cols.get("id1") or list(df.columns)[0]
-    id2_col = cols.get("sample2") or cols.get("id2") or list(df.columns)[1]
-    tot_col = cols.get("total_cm") or cols.get("length_cm") or cols.get("tot_cm") or list(df.columns)[2]
-    df["sample1"] = df[id1_col].apply(clean_id)
-    df["sample2"] = df[id2_col].apply(clean_id)
-    df["total_cM"] = pd.to_numeric(df[tot_col], errors="coerce")
-    df = df.dropna(subset=["total_cM"]).copy()
-    source_label = "Classic IBD pairs"
+    def find_first(predicates):
+        for raw in raw_cols:
+            n = norm_col(raw)
+            for p in predicates:
+                if p(n):
+                    return raw
+        return None
 
-else:  # Multi-CSV
-    st.sidebar.header("Upload genealogy CSVs")
-    focal_sample = st.sidebar.text_input("Focal sample name", value="Encarna Vicente")
-    uploaded_files = st.sidebar.file_uploader(
-        "Upload one or more CSV files",
-        type=["csv"], accept_multiple_files=True, key="multi_csv")
-    if not uploaded_files:
-        st.info("Upload one or more genealogy CSV files to begin.")
-        st.stop()
+    id1_col = find_first([
+        lambda n: n == "sample1",
+        lambda n: n == "id1",
+        lambda n: n == "kit1",
+        lambda n: n == "profile1",
+        lambda n: n == "person1",
+        lambda n: n == "individual1",
+        lambda n: n == "sample_1",
+        lambda n: n == "id_1",
+        lambda n: n.endswith("1") and any(k in n for k in ["sample", "id", "kit", "profile", "person", "individual"]),
+    ])
+
+    id2_col = find_first([
+        lambda n: n == "sample2",
+        lambda n: n == "id2",
+        lambda n: n == "kit2",
+        lambda n: n == "profile2",
+        lambda n: n == "person2",
+        lambda n: n == "individual2",
+        lambda n: n == "sample_2",
+        lambda n: n == "id_2",
+        lambda n: n == "match",
+        lambda n: n == "match_name",
+        lambda n: n == "display_name",
+        lambda n: n.endswith("2") and any(k in n for k in ["sample", "id", "kit", "profile", "person", "individual"]),
+    ])
+
+    tot_col = find_first([
+        lambda n: n == "total_cm",
+        lambda n: n == "shared_cm",
+        lambda n: n == "ibd_cm",
+        lambda n: n == "shared_dna",
+        lambda n: n == "genetic_distance",
+        lambda n: n == "length_cm",
+        lambda n: n == "tot_cm",
+        lambda n: n == "cm",
+        lambda n: "ibd" in n and "cm" in n,
+        lambda n: "total" in n and "cm" in n,
+        lambda n: "shared" in n and "cm" in n,
+        lambda n: "shared" in n and "dna" in n,
+        lambda n: "genetic" in n and "distance" in n,
+    ])
+
+    if id1_col is None and find_first([lambda n: n == "display_name"]) and find_first([lambda n: n == "percent_dna_shared"]):
+        name_col = find_first([lambda n: n == "display_name"])
+        pct_col = find_first([lambda n: n == "percent_dna_shared"])
+
+        def pct_to_cm(v):
+            f = norm_float(str(v).replace("%", ""))
+            return round(f * 71, 1) if f is not None else None
+
+        out = pd.DataFrame({
+            "sample1": "FOCAL",
+            "sample2": df[name_col].apply(clean_id),
+            "total_cM": df[pct_col].apply(pct_to_cm),
+        }).dropna(subset=["total_cM"]).copy()
+        return out
+
+    if id1_col is None or id2_col is None or tot_col is None:
+        raise ValueError(
+            "Unsupported classic pairs format. "
+            f"Columns found: {raw_cols}. "
+            f"Resolved id1={id1_col}, id2={id2_col}, total={tot_col}"
+        )
+
+    out = pd.DataFrame({
+        "sample1": df[id1_col].apply(clean_id),
+        "sample2": df[id2_col].apply(clean_id),
+        "total_cM": df[tot_col].apply(norm_float),
+    }).dropna(subset=["total_cM"]).copy()
+
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def build_pairs_from_multi(files_payload, focal_sample: str):
     all_pairs, all_segs, summary_rows = [], [], []
-    for f in uploaded_files:
+
+    for name, raw_bytes in files_payload:
+        f = type("UploadedFileLike", (), {"name": name, "getvalue": lambda self, b=raw_bytes: b})()
         pairs, segs, platform = detect_and_parse(f, focal_sample)
-        summary_rows.append({"file":f.name,"platform_detected":platform,
-                              "pairs_rows":len(pairs),"segments_rows":len(segs)})
-        if len(pairs): all_pairs.append(pairs)
-        if len(segs):  all_segs.append(segs)
-    st.subheader("Detection summary")
-    st.dataframe(pd.DataFrame(summary_rows), width='stretch')
+        summary_rows.append({
+            "file": name,
+            "platform_detected": platform,
+            "pairs_rows": len(pairs),
+            "segments_rows": len(segs),
+        })
+        if len(pairs):
+            all_pairs.append(pairs)
+        if len(segs):
+            all_segs.append(segs)
+
     if not all_pairs:
-        st.warning("No pairwise matches could be extracted.")
-        st.stop()
+        return None, None, pd.DataFrame(summary_rows)
+
     df = pd.concat(all_pairs, ignore_index=True)
     df["sample1"] = df["id1"].apply(clean_id)
     df["sample2"] = df["id2"].apply(clean_id)
     df["total_cM"] = pd.to_numeric(df["total_cM"], errors="coerce")
     df = df.dropna(subset=["total_cM"]).copy()
-    if all_segs: segments_df = pd.concat(all_segs, ignore_index=True)
+    segs = pd.concat(all_segs, ignore_index=True) if all_segs else None
+    return df, segs, pd.DataFrame(summary_rows)
+
+
+@st.cache_data(show_spinner=False)
+def build_graph_objects(df_small: pd.DataFrame):
+    G = nx.Graph()
+    for _, r in df_small.iterrows():
+        G.add_edge(r["sample1"], r["sample2"], weight=float(r["total_cM"]))
+
+    components = list(nx.connected_components(G))
+    cluster_map = {}
+    cluster_sizes = []
+
+    for i, comp in enumerate(components, start=1):
+        cname = f"Cluster {i}"
+        comp_list = list(comp)
+        for node in comp_list:
+            cluster_map[node] = cname
+        cluster_sizes.append((cname, len(comp_list)))
+
+    return G, cluster_map, cluster_sizes
+
+
+@st.cache_data(show_spinner=False)
+def build_cluster_summary(df_small: pd.DataFrame, cluster_map: dict):
+    tmp = df_small.copy()
+    tmp["cluster"] = tmp["sample1"].map(cluster_map)
+    summary = tmp.groupby("cluster").agg(
+        pair_count=("total_cM", "size"),
+        max_cM=("total_cM", "max"),
+        mean_cM=("total_cM", "mean"),
+    ).reset_index()
+
+    nodes_per_cluster = {}
+    for _, row in tmp.iterrows():
+        c = row["cluster"]
+        nodes_per_cluster.setdefault(c, set()).update([row["sample1"], row["sample2"]])
+
+    summary["node_count"] = summary["cluster"].map(lambda c: len(nodes_per_cluster.get(c, set())))
+    return summary.sort_values(["node_count", "pair_count", "max_cM"], ascending=False)
+
+
+# ───────────────────────── Session state ─────────────────────────
+
+if "favorites" not in st.session_state:
+    st.session_state["favorites"] = set()
+if "pedigree_notes" not in st.session_state:
+    st.session_state["pedigree_notes"] = ""
+
+
+# ───────────────────────── Sidebar inputs ─────────────────────────
+
+st.sidebar.header("Input mode")
+input_mode = st.sidebar.radio(
+    "Choose input source",
+    [
+        "ancIBD block TSV (no header)",
+        "Classic IBD pairs CSV/TSV",
+        "Multi-CSV genealogy loader",
+    ],
+)
+
+st.sidebar.header("Optional sample metadata")
+
+meta_file = st.sidebar.file_uploader(
+    "Metadata: CSV / TSV / AADR .anno",
+    type=["csv", "tsv", "anno", "txt"],
+    key="meta",
+)
+
+def norm_meta_col(c: str) -> str:
+    c = str(c).strip().replace("\ufeff", "")
+    c = re.sub(r"\s+", " ", c)
+    return c.lower()
+
+meta = None
+if meta_file is not None:
+    raw_meta = meta_file.getvalue()
+    text_preview = raw_meta[:20000].decode("utf-8", errors="ignore")
+
+    if meta_file.name.lower().endswith((".tsv", ".anno", ".txt")):
+        sep = "\t"
+    elif "\t" in text_preview and text_preview.count("\t") > text_preview.count(","):
+        sep = "\t"
+    elif ";" in text_preview and text_preview.count(";") > text_preview.count(","):
+        sep = ";"
+    else:
+        sep = ","
+
+    header_df = pd.read_csv(
+        io.BytesIO(raw_meta),
+        sep=sep,
+        dtype=str,
+        nrows=0,
+        on_bad_lines="skip",
+    )
+    header_cols = [str(c).strip() for c in header_df.columns]
+
+    def find_first_col(cols, predicates):
+        for raw_col in cols:
+            n = norm_meta_col(raw_col)
+            for p in predicates:
+                if p(n):
+                    return raw_col
+        return None
+
+    sid_col = find_first_col(header_cols, [
+        lambda n: n == "sample",
+        lambda n: n == "iid",
+        lambda n: n == "individual id",
+        lambda n: n == "individual_id",
+        lambda n: n == "id",
+        lambda n: n.startswith("individual id"),
+        lambda n: "individual id" in n,
+    ]) or header_cols[0]
+
+    mt_col = find_first_col(header_cols, [
+        lambda n: n == "haplogroup_mt",
+        lambda n: n == "mt_haplogroup",
+        lambda n: "mtdna haplogroup" in n,
+        lambda n: n.startswith("mtdna haplogroup"),
+        lambda n: "mitochond" in n and "haplogroup" in n,
+    ])
+
+    y_col = find_first_col(header_cols, [
+        lambda n: n == "haplogroup_y",
+        lambda n: n == "y_haplogroup",
+        lambda n: n.startswith("y haplogroup"),
+        lambda n: "y haplogroup" in n,
+        lambda n: "ychr" in n and "haplogroup" in n,
+    ])
+
+    wanted_cols = [sid_col]
+    if mt_col is not None:
+        wanted_cols.append(mt_col)
+    if y_col is not None and y_col not in wanted_cols:
+        wanted_cols.append(y_col)
+
+    meta = pd.read_csv(
+        io.BytesIO(raw_meta),
+        sep=sep,
+        dtype=str,
+        usecols=wanted_cols,
+        on_bad_lines="skip",
+        low_memory=False,
+    )
+    meta.columns = [str(c).strip() for c in meta.columns]
+
+    meta["sample_clean"] = meta[sid_col].apply(clean_id)
+    meta = meta.set_index("sample_clean")
+
+    if mt_col is not None and mt_col in meta.columns:
+        meta.rename(columns={mt_col: "haplogroup_mt"}, inplace=True)
+    else:
+        meta["haplogroup_mt"] = pd.NA
+
+    if y_col is not None and y_col in meta.columns:
+        meta.rename(columns={y_col: "haplogroup_y"}, inplace=True)
+    else:
+        meta["haplogroup_y"] = pd.NA
+
+    st.sidebar.caption(f"Metadata columns detected: ID={sid_col} | mt={mt_col} | Y={y_col}")
+
+# ───────────────────────── Data loading ─────────────────────────
+
+df = None
+segments_df = None
+source_label = None
+
+if input_mode == "ancIBD block TSV (no header)":
+    anc_file = st.sidebar.file_uploader("Upload ancIBD block file", key="ancibd")
+    if anc_file is None:
+        st.info("Upload your ancIBD block file. For big files, pre-filtering by cM is strongly recommended.")
+        st.stop()
+
+    raw = anc_file.getvalue()
+    df = build_pairs_from_ancibd(raw, anc_file.name)
+    st.info(f"Parsed {len(df):,} ancIBD pairs from file.")
+
+    if df.empty:
+        st.error("No pairs could be extracted. Check the file format.")
+        st.stop()
+
+    df["sample1"] = df["sample1"].apply(clean_id)
+    df["sample2"] = df["sample2"].apply(clean_id)
+    source_label = f"ancIBD block TSV ({anc_file.name})"
+
+    with st.expander("Parsed pairs preview", expanded=False):
+        st.dataframe(df.head(200), width="stretch", height=220)
+
+elif input_mode == "Classic IBD pairs CSV/TSV":
+    ibd_file = st.sidebar.file_uploader("Upload classic pairs file", key="ibd")
+    if ibd_file is None:
+        st.info("Upload a CSV/TSV with id1,id2,total_cM.")
+        st.stop()
+
+    raw = ibd_file.getvalue()
+
+    try:
+        df = build_pairs_from_classic(raw, ibd_file.name)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    source_label = f"Classic pairs ({ibd_file.name})"
+
+else:
+    focal_sample = st.sidebar.text_input("Focal sample name", value="Encarna Vicente")
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload one or more genealogy CSV files",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="multi_csv",
+    )
+    if not uploaded_files:
+        st.info("Upload one or more genealogy CSV files to begin.")
+        st.stop()
+
+    payload = [(f.name, f.getvalue()) for f in uploaded_files]
+    df, segments_df, summary_rows = build_pairs_from_multi(payload, focal_sample)
+
+    st.subheader("Detection summary")
+    st.dataframe(summary_rows, width="stretch")
+
+    if df is None or df.empty:
+        st.warning("No pairwise matches could be extracted.")
+        st.stop()
+
     source_label = "Unified genealogy loader"
-    st.download_button("Download unified pairs CSV",
-        df[["sample1","sample2","total_cM"]].rename(columns={"sample1":"id1","sample2":"id2"}).to_csv(index=False).encode("utf-8"),
-        file_name="unified_pairs.csv", mime="text/csv")
-    if segments_df is not None:
-        st.download_button("Download unified segments CSV",
-            segments_df.to_csv(index=False).encode("utf-8"),
-            file_name="unified_segments.csv", mime="text/csv")
+    st.download_button(
+        "Download unified pairs CSV",
+        df[["sample1", "sample2", "total_cM"]]
+        .rename(columns={"sample1": "id1", "sample2": "id2"})
+        .to_csv(index=False)
+        .encode("utf-8"),
+        file_name="unified_pairs.csv",
+        mime="text/csv",
+    )
+
+
+# ───────────────────────── Optional threshold before graph build ─────────────────────────
 
 df["relationship_class"] = df["total_cM"].apply(classify_relationship)
 
 st.subheader(f"Pairwise IBD input ({source_label})")
-st.dataframe(df[["sample1","sample2","total_cM","relationship_class"]].sort_values("total_cM",ascending=False).head(2000),
-             width='stretch', height=220)
+col_a, col_b = st.columns([3, 1])
 
-# ───────────────────────── Graph & clusters ─────────────────────────
+with col_a:
+    st.dataframe(
+        df[["sample1", "sample2", "total_cM", "relationship_class"]]
+        .sort_values("total_cM", ascending=False)
+        .head(1000),
+        width="stretch",
+        height=240,
+    )
 
-G = nx.Graph()
-for _, r in df.iterrows():
-    G.add_edge(r["sample1"], r["sample2"], weight=r["total_cM"])
+with col_b:
+    min_cm_build = st.number_input(
+        "Minimum cM to build clusters",
+        min_value=float(df["total_cM"].min()),
+        max_value=float(df["total_cM"].max()),
+        value=max(40.0, float(df["total_cM"].min())),
+        step=1.0,
+    )
 
-components = list(nx.connected_components(G))
-cluster_map = {}
-for i, comp in enumerate(components, start=1):
-    for node in comp:
-        cluster_map[node] = f"Cluster {i}"
+build_df = df[df["total_cM"] >= min_cm_build].copy()
+st.caption(f"Working set after build threshold: {len(build_df):,} pairs out of {len(df):,}")
+
+if build_df.empty:
+    st.warning("No pairs remain after the selected minimum cM threshold.")
+    st.stop()
+
+with st.spinner("Building graph and cluster summary..."):
+    G, cluster_map, cluster_sizes = build_graph_objects(build_df[["sample1", "sample2", "total_cM"]])
 
 rows = []
 for node in G.nodes():
     partners = list(G.neighbors(node))
     totals = [G[node][p]["weight"] for p in partners]
-    row = {"sample":node,"cluster":cluster_map[node],"partners":len(partners),
-           "max_pairwise_cM":max(totals) if totals else 0.0}
+    row = {
+        "sample": node,
+        "cluster": cluster_map[node],
+        "partners": len(partners),
+        "max_pairwise_cM": max(totals) if totals else 0.0,
+    }
     if meta is not None and node in meta.index:
         for col in meta.columns:
             row[col] = meta.loc[node, col]
     rows.append(row)
 
-df_samples = pd.DataFrame(rows).sort_values(["cluster","sample"])
-st.subheader("Sample assignments")
-st.dataframe(df_samples.head(2000), width='stretch', height=220)
+df_samples = pd.DataFrame(rows).sort_values(["cluster", "sample"])
+cluster_summary = build_cluster_summary(build_df[["sample1", "sample2", "total_cM"]], cluster_map)
 
-# ───────────────────────── Sidebar: cluster controls ─────────────────────────
+st.subheader("Cluster summary")
+st.dataframe(cluster_summary.head(500), width="stretch", height=260)
 
-st.sidebar.header("Cluster view")
-clusters = sorted(df_samples["cluster"].unique())
+
+# ───────────────────────── Sidebar cluster controls ─────────────────────────
+
+st.sidebar.header("Cluster selection")
+clusters = cluster_summary["cluster"].tolist()
+
 search_id = st.sidebar.text_input("Search sample ID (partial ok)")
 cluster_from_id = None
-if search_id:
-    hits = df_samples[df_samples["sample"].astype(str).str.contains(search_id.strip(), case=False, na=False, regex=False)]
-    if not hits.empty:
-        hit_c = sorted(hits["cluster"].unique())
-        cluster_from_id = hit_c[0] if len(hit_c)==1 else st.sidebar.selectbox("Multiple clusters matched, choose one",hit_c)
-    st.sidebar.write(f"{len(hits)} samples matched." if not hits.empty else "No samples matched.")
+if search_id and not df_samples.empty:
+    hits = df_samples[
+        df_samples["sample"].astype(str).str.contains(search_id.strip(), case=False, na=False, regex=False)
+    ]
+    hit_clusters = sorted(hits["cluster"].unique())
+    if len(hit_clusters) == 1:
+        cluster_from_id = hit_clusters[0]
+    elif len(hit_clusters) > 1:
+        cluster_from_id = st.sidebar.selectbox("Multiple clusters matched this ID", hit_clusters)
+    st.sidebar.write(f"{len(hits)} samples matched." if len(hits) else "No samples matched.")
 
 cluster_from_hg = None
-if meta is not None:
+if meta is not None and not df_samples.empty:
     search_haplo = st.sidebar.text_input("Search haplogroup (mt or Y)")
     if search_haplo:
         hg_cols = [c for c in df_samples.columns if "haplogroup" in c.lower()]
         if hg_cols:
             mask = pd.Series(False, index=df_samples.index)
             for c in hg_cols:
-                mask |= df_samples[c].astype(str).str.contains(search_haplo.strip(), case=False, na=False, regex=False)
+                mask = mask | df_samples[c].astype(str).str.contains(
+                    search_haplo.strip(), case=False, na=False, regex=False
+                )
             hits_hg = df_samples[mask]
-            if not hits_hg.empty:
-                hc = sorted(hits_hg["cluster"].unique())
-                cluster_from_hg = hc[0] if len(hc)==1 else st.sidebar.selectbox("Multiple haplogroup clusters",hc)
-            st.sidebar.write(f"{len(hits_hg)} samples matched." if not hits_hg.empty else "No samples matched.")
+            hit_clusters_hg = sorted(hits_hg["cluster"].unique())
+            if len(hit_clusters_hg) == 1:
+                cluster_from_hg = hit_clusters_hg[0]
+            elif len(hit_clusters_hg) > 1:
+                cluster_from_hg = st.sidebar.selectbox("Multiple haplogroup clusters matched", hit_clusters_hg)
+            st.sidebar.write(f"{len(hits_hg)} samples matched." if len(hits_hg) else "No haplogroups matched.")
 
-default_cluster = cluster_from_id or cluster_from_hg or "All"
-selected = st.sidebar.selectbox("Select cluster", ["All"]+clusters,
-    index=(["All"]+clusters).index(default_cluster) if default_cluster in ["All"]+clusters else 0)
+default_cluster = cluster_from_id or cluster_from_hg or (clusters[0] if clusters else None)
+if default_cluster is None:
+    st.warning("No clusters available after filtering.")
+    st.stop()
 
-c1f,c2f = st.sidebar.columns(2)
-with c1f:
-    if st.button("★ Add to favorites") and selected != "All":
+selected = st.sidebar.selectbox(
+    "Select cluster to inspect",
+    clusters,
+    index=clusters.index(default_cluster) if default_cluster in clusters else 0,
+)
+
+cf1, cf2 = st.sidebar.columns(2)
+with cf1:
+    if st.button("★ Favorite"):
         st.session_state["favorites"].add(selected)
-with c2f:
-    if st.button("Clear favorites"):
+with cf2:
+    if st.button("Clear favs"):
         st.session_state["favorites"] = set()
+
 if st.session_state["favorites"]:
-    st.sidebar.markdown("**Favorites:**")
-    for c in sorted(st.session_state["favorites"]): st.sidebar.write(f"- {c}")
+    st.sidebar.markdown("**Favorites**")
+    for c in sorted(st.session_state["favorites"]):
+        st.sidebar.write(f"- {c}")
 
-# ───────────────────────── Main layout ─────────────────────────
 
-left, right = st.columns([1.1, 1.2])
+# ───────────────────────── Selected cluster only ─────────────────────────
+
+selected_nodes = [n for n, c in cluster_map.items() if c == selected]
+selected_pairs = build_df[
+    build_df["sample1"].isin(selected_nodes) & build_df["sample2"].isin(selected_nodes)
+].copy()
+selected_samples = df_samples[df_samples["cluster"] == selected].copy()
+
+left, right = st.columns([1.05, 1.15])
 
 with left:
-    samples_view = df_samples[df_samples["cluster"]==selected].copy() if selected!="All" else df_samples.copy()
-    st.subheader("Samples in current view")
-    st.dataframe(samples_view.head(500), width='stretch', height=280)
+    st.subheader(f"Samples in {selected}")
+    st.dataframe(selected_samples.head(1000), width="stretch", height=320)
 
     st.subheader("Pedigree notes console")
-    sample_choices = samples_view["sample"].tolist()
-    sel_note = st.selectbox("Select sample to append", sample_choices or [""], key="sample_to_add_notes")
-    nc1,nc2,nc3 = st.columns(3)
-    with nc1:
+    sample_choices = selected_samples["sample"].tolist()
+    sel_note = st.selectbox(
+        "Select sample to append",
+        sample_choices if sample_choices else [""],
+        key="sample_to_add_notes",
+    )
+
+    n1, n2, n3 = st.columns(3)
+    with n1:
         if st.button("Add sample") and sample_choices:
-            row = samples_view[samples_view["sample"]==sel_note].iloc[0]
+            row = selected_samples[selected_samples["sample"] == sel_note].iloc[0]
             line = make_note_line(row)
             if line not in st.session_state["pedigree_notes"]:
-                st.session_state["pedigree_notes"] += line+"\n"
-    with nc2:
-        if st.button("Add all cluster") and not samples_view.empty:
+                st.session_state["pedigree_notes"] += line + "\n"
+
+    with n2:
+        if st.button("Add cluster") and not selected_samples.empty:
             existing = set(filter(None, st.session_state["pedigree_notes"].splitlines()))
-            for _, r in samples_view.iterrows():
+            for _, r in selected_samples.iterrows():
                 line = make_note_line(r)
                 if line not in existing:
-                    st.session_state["pedigree_notes"] += line+"\n"; existing.add(line)
-    with nc3:
+                    st.session_state["pedigree_notes"] += line + "\n"
+                    existing.add(line)
+
+    with n3:
         if st.button("Clear notes"):
             st.session_state["pedigree_notes"] = ""
-    st.text_area("Notes", key="pedigree_notes", height=200)
-    st.download_button("Download notes.txt", st.session_state["pedigree_notes"].encode("utf-8"),
-                       file_name="pedigree_notes.txt", mime="text/plain")
+
+    st.text_area("Notes", key="pedigree_notes", height=180)
+    st.download_button(
+        "Download notes.txt",
+        st.session_state["pedigree_notes"].encode("utf-8"),
+        file_name="pedigree_notes.txt",
+        mime="text/plain",
+    )
 
 with right:
-    st.subheader("Pairwise relationships")
-    cm_min_val = float(df["total_cM"].min())
-    cm_max_val = float(df["total_cM"].max())
-    cm_default = min(1000.0, cm_max_val)
-    fc1,fc2 = st.columns([3,1])
-    with fc1:
-        min_cm_slider = st.slider("Min total IBD (cM)", cm_min_val, cm_max_val, cm_default, step=10.0, key="min_cm_slider")
-    with fc2:
-        min_cm_input = st.number_input("Exact cM", cm_min_val, cm_max_val, min_cm_slider, step=1.0, key="min_cm_input")
-    min_cm = min_cm_input if min_cm_input != min_cm_slider else min_cm_slider
-
-    only_cluster = df.copy()
-    if selected != "All":
-        nodes_sel = [n for n,c in cluster_map.items() if c==selected]
-        only_cluster = only_cluster[only_cluster["sample1"].isin(nodes_sel) & only_cluster["sample2"].isin(nodes_sel)]
-    only_cluster = only_cluster[only_cluster["total_cM"] >= min_cm].copy()
-    st.dataframe(only_cluster[["sample1","sample2","total_cM","relationship_class"]].sort_values("total_cM",ascending=False).head(1000),
-                 width='stretch', height=230)
-
-    nodes = [s for s in G.nodes() if cluster_map[s]==selected] if selected!="All" else list(G.nodes())
-    if len(nodes) > 300:
-        st.warning(f"Graph limited to 300 nodes (total: {len(nodes)}). Select a specific cluster to see full detail.")
-        nodes = nodes[:300]
-    H = G.subgraph(nodes)
-    title = f"IBD network ({selected})" if selected!="All" else "IBD network (All clusters)"
-
-    if H.number_of_nodes() == 0:
-        st.warning("No nodes to display.")
+    st.subheader(f"Pairwise relationships in {selected}")
+    if selected_pairs.empty:
+        st.info("No pairwise relationships remain in this cluster after filtering.")
     else:
-        try:
-            pos = nx.spring_layout(H, weight="weight", seed=42)
-        except Exception:
-            pos = nx.circular_layout(H)
+        min_c = float(selected_pairs["total_cM"].min())
+        max_c = float(selected_pairs["total_cM"].max())
 
-        node_x,node_y,text_labels,hovertext = [],[],[],[]
-        for n,(px,py) in pos.items():
-            node_x.append(px); node_y.append(py)
-            text_labels.append(n if selected!="All" else "")
-            label = n
-            if meta is not None and n in meta.index:
-                if "haplogroup_mt" in meta.columns: label += f" | mt:{meta.loc[n,'haplogroup_mt']}"
-                if "haplogroup_y"  in meta.columns: label += f" | Y:{meta.loc[n,'haplogroup_y']}"
-            hovertext.append(label)
+        fc1, fc2 = st.columns([3, 1])
+        with fc1:
+            min_cm_view = st.slider(
+                "Min total IBD (cM) in selected cluster",
+                min_value=min_c,
+                max_value=max_c,
+                value=min_c,
+                step=1.0,
+            )
+        with fc2:
+            min_cm_exact = st.number_input(
+                "Exact cM",
+                min_value=min_c,
+                max_value=max_c,
+                value=min_cm_view,
+                step=1.0,
+            )
 
-        edge_x,edge_y = [],[]
-        for u,v in H.edges():
-            edge_x += [pos[u][0],pos[v][0],None]
-            edge_y += [pos[u][1],pos[v][1],None]
+        min_cm = min_cm_exact if min_cm_exact != min_cm_view else min_cm_view
+        view_pairs = selected_pairs[selected_pairs["total_cM"] >= min_cm].copy()
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines",
-            line=dict(color="rgba(150,150,150,0.4)",width=1), hoverinfo="none"))
-        fig.add_trace(go.Scatter(x=node_x, y=node_y, mode="markers+text",
-            text=text_labels if selected!="All" else None,
-            textposition="top center",
-            marker=dict(size=10,color="steelblue"),
-            hovertext=hovertext, hoverinfo="text"))
-        fig.update_layout(title=title, xaxis=dict(visible=False), yaxis=dict(visible=False),
-            showlegend=False, height=680, margin=dict(l=10,r=10,t=50,b=10))
-        st.plotly_chart(fig, width='stretch')
+        st.dataframe(
+            view_pairs[["sample1", "sample2", "total_cM"]]
+            .sort_values("total_cM", ascending=False)
+            .head(1000),
+            width="stretch",
+            height=220,
+        )
+
+        if view_pairs.empty:
+            st.warning("No edges remain in this cluster view after the selected cM threshold.")
+        else:
+            H = nx.Graph()
+            for _, r in view_pairs.iterrows():
+                H.add_edge(r["sample1"], r["sample2"], weight=float(r["total_cM"]))
+
+            nodes = list(H.nodes())
+            if len(nodes) > 300:
+                st.warning(f"Graph limited to top 300 nodes in this cluster (total: {len(nodes)}).")
+                degree_rank = sorted(H.degree, key=lambda x: x[1], reverse=True)[:300]
+                keep = [n for n, _ in degree_rank]
+                H = H.subgraph(keep).copy()
+
+            try:
+                pos = nx.spring_layout(H, weight="weight", seed=42)
+            except Exception:
+                pos = nx.circular_layout(H)
+
+            node_x, node_y, text_labels, hovertext = [], [], [], []
+            for n, (px, py) in pos.items():
+                node_x.append(px)
+                node_y.append(py)
+                text_labels.append(n)
+                label = n
+                if meta is not None and n in meta.index:
+                    if "haplogroup_mt" in meta.columns:
+                        label += f" | mt: {meta.loc[n, 'haplogroup_mt']}"
+                    if "haplogroup_y" in meta.columns:
+                        label += f" | Y: {meta.loc[n, 'haplogroup_y']}"
+                hovertext.append(label)
+
+            edge_x, edge_y = [], []
+            for u, v in H.edges():
+                edge_x += [pos[u][0], pos[v][0], None]
+                edge_y += [pos[u][1], pos[v][1], None]
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=edge_x,
+                    y=edge_y,
+                    mode="lines",
+                    line=dict(color="rgba(150,150,150,0.35)", width=1),
+                    hoverinfo="none",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=node_x,
+                    y=node_y,
+                    mode="markers+text",
+                    text=text_labels,
+                    textposition="top center",
+                    marker=dict(size=10, color="steelblue"),
+                    hovertext=hovertext,
+                    hoverinfo="text",
+                )
+            )
+            fig.update_layout(
+                title=f"IBD network — {selected}",
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+                showlegend=False,
+                height=680,
+                margin=dict(l=10, r=10, t=50, b=10),
+            )
+            st.plotly_chart(fig, width="stretch")
 
 if segments_df is not None:
     st.subheader("Unified segments preview")
-    st.dataframe(segments_df.head(200), width='stretch', height=200)
+    st.dataframe(segments_df.head(200), width="stretch", height=200)
