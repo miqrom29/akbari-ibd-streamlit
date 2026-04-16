@@ -767,8 +767,8 @@ if "date_mean_bp" in df_samples.columns and df_samples["date_mean_bp"].notna().a
         )
         _tmp2 = _tmp[_tmp["cluster"].isin(_top_clusters)]
 
-        import plotly.express as px
-        _color_seq = px.colors.qualitative.Plotly
+        import plotly.express as plx
+        _color_seq = plx.colors.qualitative.Plotly
         _cluster_colors = {c: _color_seq[i % len(_color_seq)] for i, c in enumerate(_top_clusters)}
 
         fig_time = go.Figure()
@@ -1004,7 +1004,8 @@ with right:
             except Exception:
                 pos = nx.circular_layout(H)
 
-                node_x, node_y, text_labels, hovertext, node_colors = [], [], [], [], []
+
+            node_x, node_y, text_labels, hovertext, node_colors = [], [], [], [], []
             for n, (px, py) in pos.items():
                 node_x.append(px)
                 node_y.append(py)
