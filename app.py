@@ -311,6 +311,160 @@ def detect_and_parse(file, focal_sample):
         return p, s, "23andMe (relatives)"
     return pd.DataFrame(columns=["id1", "id2", "total_cM", "platform", "source_file"]), _empty_segs(), "Unknown/unsupported (yet)"
 
+
+# ───────────────────────── Akbari 2026 XLSX + multi-metadata ─────────────────────────
+
+def parse_akbari_xlsx(raw_bytes: bytes) -> pd.DataFrame:
+    """Parse Akbari2026 Supplementary Table 1 XLSX.
+    Row 0 = títol taula. Row 1 = noms de columna. Row 2+ = dades."""
+    AKBARI_MAP = {
+        "genetic version identifier": "sample_clean",
+        "unique individual identifier": "iid_base",
+        "political entity": "country",
+        "latitute": "lat",
+        "latitude": "lat",
+        "longitude": "lon",
+        "date mean in bp": "date_mean_bp",
+        "broad geographic region": "broad_region",
+        "mean coverage": "coverage",
+        "data source": "data_source",
+        "in unrelated set": "unrelated",
+        "publication if some or all": "publication",
+    }
+    try:
+        df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=1, dtype=str)
+    except Exception:
+        df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+    rename = {}
+    for col in df.columns:
+        cl = col.lower()
+        for pattern, target in AKBARI_MAP.items():
+            if pattern in cl and target not in rename.values():
+                rename[col] = target
+                break
+    df = df.rename(columns=rename)
+    if "sample_clean" not in df.columns and "iid_base" in df.columns:
+        df["sample_clean"] = df["iid_base"].astype(str).str.strip().apply(clean_id)
+    elif "sample_clean" in df.columns:
+        df["sample_clean"] = df["sample_clean"].astype(str).str.strip().apply(clean_id)
+    else:
+        df["sample_clean"] = df.iloc[:, 0].astype(str).str.strip().apply(clean_id)
+    for c in ["date_mean_bp", "lat", "lon", "coverage"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["sample_clean"])
+    df = df[df["sample_clean"].str.match(r"[A-Za-z0-9]")].copy()
+    return df.set_index("sample_clean")
+
+
+def norm_meta_col(c: str) -> str:
+    c = str(c).strip().replace("\ufeff", "")
+    c = re.sub(r"\s+", " ", c)
+    return c.lower()
+
+
+def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Carrega un fitxer de metadata (CSV/TSV/anno/XLSX) i retorna
+    un DataFrame indexat per sample_clean."""
+    if filename.lower().endswith(".xlsx"):
+        return parse_akbari_xlsx(raw_bytes)
+    if filename.lower().endswith((".tsv", ".anno", ".txt")):
+        sep = "\t"
+    else:
+        preview = raw_bytes[:20000].decode("utf-8", errors="ignore")
+        if preview.count("\t") > preview.count(","):
+            sep = "\t"
+        elif preview.count(";") > preview.count(","):
+            sep = ";"
+        else:
+            sep = ","
+    try:
+        df = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, dtype=str,
+                         on_bad_lines="skip", low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    def _find(preds):
+        for raw_col in df.columns:
+            n = norm_meta_col(raw_col)
+            for p in preds:
+                if p(n):
+                    return raw_col
+        return None
+
+    sid_col = _find([
+        lambda n: n == "sample",
+        lambda n: n == "iid",
+        lambda n: n == "#iid",
+        lambda n: n == "individual id",
+        lambda n: n == "individual_id",
+        lambda n: n == "id",
+        lambda n: "individual id" in n,
+    ]) or df.columns[0]
+
+    mt_col = _find([
+        lambda n: n == "haplogroup_mt",
+        lambda n: n == "mt_haplogroup",
+        lambda n: "mtdna haplogroup" in n,
+        lambda n: "mitochond" in n and "haplogroup" in n,
+    ])
+    y_col = _find([
+        lambda n: n in ("haplogroup_y", "y_haplogroup", "snp", "y_snp"),
+        lambda n: "y haplogroup" in n,
+    ])
+    bp_col = _find([
+        lambda n: "date mean in bp" in n,
+        lambda n: n in ("date_mean_bp", "st1_date_mean_bp"),
+    ])
+    br_col = _find([
+        lambda n: "broad geographic region" in n,
+        lambda n: n == "broad_region",
+    ])
+
+    df["sample_clean"] = (
+        df[sid_col].astype(str).str.strip()
+        .str.replace(r"\s+", "", regex=True).apply(clean_id)
+    )
+    if mt_col:
+        df = df.rename(columns={mt_col: "haplogroup_mt"})
+    else:
+        df["haplogroup_mt"] = pd.NA
+    if y_col and y_col in df.columns:
+        df = df.rename(columns={y_col: "haplogroup_y"})
+    else:
+        df["haplogroup_y"] = pd.NA
+    if bp_col and bp_col != "date_mean_bp" and bp_col in df.columns:
+        df = df.rename(columns={bp_col: "date_mean_bp"})
+    if br_col and br_col != "broad_region" and br_col in df.columns:
+        df = df.rename(columns={br_col: "broad_region"})
+    for c in ["haplogroup_mt", "haplogroup_y"]:
+        if c in df.columns:
+            df[c] = df[c].replace(
+                {"nan": pd.NA, "None": pd.NA, "": pd.NA, ".": pd.NA,
+                 "..": pd.NA, "n/a": pd.NA, "NA": pd.NA}
+            )
+            df[c] = df[c].astype("string")
+    df = df.dropna(subset=["sample_clean"]).drop_duplicates(
+        subset=["sample_clean"], keep="first"
+    )
+    return df.set_index("sample_clean")
+
+
+def merge_meta_frames(frames: list) -> pd.DataFrame:
+    """Fusiona llista de DataFrames indexats per sample_clean.
+    Primer fitxer té prioritat; combine_first omple els buits."""
+    if not frames:
+        return pd.DataFrame()
+    combined = frames[0]
+    for other in frames[1:]:
+        try:
+            combined = combined.combine_first(other)
+        except Exception:
+            pass
+    return combined
+
 # ───────────────────────── Cached builders ─────────────────────────
 
 @st.cache_data(show_spinner=False)
@@ -462,6 +616,8 @@ if "favorites" not in st.session_state:
     st.session_state["favorites"] = set()
 if "pedigree_notes" not in st.session_state:
     st.session_state["pedigree_notes"] = ""
+if "cluster_target" not in st.session_state:
+    st.session_state["cluster_target"] = None
 
 # ───────────────────────── Sidebar inputs ─────────────────────────
 
@@ -470,159 +626,34 @@ input_mode = st.sidebar.radio("Choose input source", [
     "ancIBD block TSV (no header)",
     "Classic IBD pairs CSV/TSV",
     "Multi-CSV genealogy loader",
-])
-
+], index=1)
 st.sidebar.header("Optional sample metadata")
-meta_file = st.sidebar.file_uploader(
-    "Metadata: CSV / TSV / AADR .anno",
-    type=["csv", "tsv", "anno", "txt"],
+meta_files = st.sidebar.file_uploader(
+    "Metadata files — CSV / TSV / AADR .anno / Akbari XLSX",
+    type=["csv", "tsv", "anno", "txt", "xlsx"],
+    accept_multiple_files=True,
     key="meta",
 )
 
-def norm_meta_col(c: str) -> str:
-    c = str(c).strip().replace("\ufeff", "")
-    c = re.sub(r"\s+", " ", c)
-    return c.lower()
-
 meta = None
-if meta_file is not None:
-    raw_meta = meta_file.getvalue()
-    text_preview = raw_meta[:20000].decode("utf-8", errors="ignore")
-
-    if meta_file.name.lower().endswith((".tsv", ".anno", ".txt")):
-        sep = "\t"
-    elif "\t" in text_preview and text_preview.count("\t") > text_preview.count(","):
-        sep = "\t"
-    elif ";" in text_preview and text_preview.count(";") > text_preview.count(","):
-        sep = ";"
-    else:
-        sep = ","
-
-    header_df = pd.read_csv(io.BytesIO(raw_meta), sep=sep, dtype=str, nrows=0, on_bad_lines="skip")
-    header_cols = [str(c).strip() for c in header_df.columns]
-
-    def find_first_col(cols, predicates):
-        for raw_col in cols:
-            n = norm_meta_col(raw_col)
-            for p in predicates:
-                if p(n):
-                    return raw_col
-        return None
-
-    sid_col = find_first_col(header_cols, [
-        lambda n: n == "sample",
-        lambda n: n == "iid",
-        lambda n: n == "#iid",
-        lambda n: n == "individual id",
-        lambda n: n == "individual_id",
-        lambda n: n == "id",
-        lambda n: n.startswith("individual id"),
-        lambda n: "individual id" in n,
-    ]) or header_cols[0]
-
-    mt_col = find_first_col(header_cols, [
-        lambda n: n == "haplogroup_mt",
-        lambda n: n == "mt_haplogroup",
-        lambda n: "mtdna haplogroup" in n,
-        lambda n: n.startswith("mtdna haplogroup"),
-        lambda n: "mitochond" in n and "haplogroup" in n,
-    ])
-
-    y_col = find_first_col(header_cols, [
-        lambda n: n == "haplogroup_y",
-        lambda n: n == "y_haplogroup",
-        lambda n: n == "snp",
-        lambda n: n == "y_snp",
-        lambda n: n.startswith("y haplogroup"),
-        lambda n: "y haplogroup" in n,
-        lambda n: "ychr" in n and "haplogroup" in n,
-    ])
-
-    # ── Columnes noves Akbari2026: detectem el nom real de la columna ──
-    bp_col = find_first_col(header_cols, [
-        lambda n: "date mean in bp" in n,
-        lambda n: n == "date_mean_bp",
-        lambda n: n == "st1_date_mean_bp",
-    ])
-    br_col = find_first_col(header_cols, [
-        lambda n: "broad geographic region" in n,
-        lambda n: n == "broad_region",
-    ])
-
-    # Columnes addicionals a carregar (noms exactes del CSV)
-    extra_candidates = [
-        "country", "site", "culture", "date_mean_bp", "full_date", "location", "region",
-        "Closest cluster", "closest pop", "closest sample", "distance", "F_MISS", "N_MISS",
-        "cluster_id", "cluster_size", "ID_core", "st1_uid", "date_source",
-    ]
-    # Afegim el nom real de les columnes noves si existeixen al fitxer
-    if bp_col is not None:
-        extra_candidates.append(bp_col)
-    if br_col is not None:
-        extra_candidates.append(br_col)
-
-    wanted_cols = [sid_col]
-    if mt_col is not None:
-        wanted_cols.append(mt_col)
-    if y_col is not None and y_col not in wanted_cols:
-        wanted_cols.append(y_col)
-    for col in extra_candidates:
-        if col in header_cols and col not in wanted_cols:
-            wanted_cols.append(col)
-
-    # Llegim el CSV amb les columnes volgudes
-    meta = pd.read_csv(
-        io.BytesIO(raw_meta),
-        sep=sep,
-        dtype=str,
-        usecols=wanted_cols,
-        on_bad_lines="skip",
-        low_memory=False,
-    )
-    meta.columns = [str(c).strip() for c in meta.columns]
-
-    # ── Rename columnes Akbari2026 a noms curts (ara meta ja existeix) ──
-    if bp_col is not None and bp_col in meta.columns and bp_col != "date_mean_bp":
-        meta.rename(columns={bp_col: "date_mean_bp"}, inplace=True)
-    if br_col is not None and br_col in meta.columns and br_col != "broad_region":
-        meta.rename(columns={br_col: "broad_region"}, inplace=True)
-
-    meta["sample_clean"] = (
-        meta[sid_col]
-        .astype(str)
-        .str.strip()
-        .str.replace(r"\s+", "", regex=True)
-        .apply(clean_id)
-    )
-
-    if mt_col is not None and mt_col in meta.columns:
-        meta.rename(columns={mt_col: "haplogroup_mt"}, inplace=True)
-    else:
-        meta["haplogroup_mt"] = pd.NA
-
-    if y_col is not None and y_col in meta.columns:
-        meta.rename(columns={y_col: "haplogroup_y"}, inplace=True)
-    else:
-        meta["haplogroup_y"] = pd.NA
-
-    for c in ["haplogroup_mt", "haplogroup_y"]:
-        meta[c] = meta[c].replace(r"^\s*$", pd.NA, regex=True)
-        meta[c] = meta[c].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA, ".": pd.NA, "..": pd.NA, "n/a": pd.NA, "NA": pd.NA})
-        meta[c] = meta[c].astype("string")
-
-    for c in ["country", "site", "culture", "region", "broad_region", "Closest cluster", "closest pop", "date_source"]:
-        if c in meta.columns:
-            meta[c] = meta[c].astype("category")
-
-    meta = meta.dropna(subset=["sample_clean"]).drop_duplicates(subset=["sample_clean"], keep="first").set_index("sample_clean")
-
-    st.sidebar.caption(f"Metadata columns detected: ID={sid_col} | mt={mt_col} | Y={y_col}")
-    st.sidebar.caption(f"Metadata rows loaded: {len(meta):,}")
-    st.sidebar.caption(f"mt non-null: {meta['haplogroup_mt'].notna().sum():,} | Y non-null: {meta['haplogroup_y'].notna().sum():,}")
-    bp_ok = meta["date_mean_bp"].notna().sum() if "date_mean_bp" in meta.columns else 0
-    br_ok = meta["broad_region"].notna().sum() if "broad_region" in meta.columns else 0
-    if bp_ok or br_ok:
-        st.sidebar.caption(f"BP non-null: {bp_ok:,} | broad_region non-null: {br_ok:,}")
+if meta_files:
+    _meta_frames = []
+    for _mf in meta_files:
+        _raw = _mf.getvalue()
+        _df = load_metadata_file(_raw, _mf.name)
+        if not _df.empty:
+            _meta_frames.append(_df)
+            st.sidebar.caption(f"✓ {_mf.name}: {len(_df):,} rows")
+    if _meta_frames:
+        meta = merge_meta_frames(_meta_frames)
+        st.sidebar.caption(f"Metadata merged: {len(meta):,} total rows")
+        _mt_ok = meta["haplogroup_mt"].notna().sum() if "haplogroup_mt" in meta.columns else 0
+        _y_ok  = meta["haplogroup_y"].notna().sum()  if "haplogroup_y"  in meta.columns else 0
+        _bp_ok = meta["date_mean_bp"].notna().sum()  if "date_mean_bp"  in meta.columns else 0
+        _br_ok = meta["broad_region"].notna().sum()  if "broad_region"  in meta.columns else 0
+        st.sidebar.caption(f"mt non-null: {_mt_ok:,} | Y non-null: {_y_ok:,}")
+        if _bp_ok or _br_ok:
+            st.sidebar.caption(f"BP non-null: {_bp_ok:,} | broad_region non-null: {_br_ok:,}")
 
 # ───────────────────────── Data loading ─────────────────────────
 
@@ -819,6 +850,10 @@ if search_id and not df_samples.empty:
         cluster_from_id = st.sidebar.selectbox("Multiple clusters matched this ID", hit_clusters)
     st.sidebar.write(f"{len(hits)} samples matched." if len(hits) else "No samples matched.")
 
+    if cluster_from_id:
+        if st.sidebar.button("🔍 Load cluster (ID search)", key="load_id"):
+            st.session_state["cluster_target"] = cluster_from_id
+            st.rerun()
 cluster_from_hg = None
 if meta is not None and not df_samples.empty:
     search_haplo = st.sidebar.text_input("Search haplogroup (mt or Y)")
@@ -856,12 +891,21 @@ if meta is not None and not df_samples.empty:
                         key="hg_cluster_select",
                     )
 
-default_cluster = cluster_from_id or cluster_from_hg or (clusters[0] if clusters else None)
-if default_cluster is None:
+                if cluster_from_hg:
+                    if st.sidebar.button("🔍 Load cluster (haplogroup search)", key="load_hg"):
+                        st.session_state["cluster_target"] = cluster_from_hg
+                        st.rerun()
+# Resolem cluster a mostrar: botó de cerca > search > primer cluster
+_resolve = (st.session_state.get("cluster_target") or
+            cluster_from_id or cluster_from_hg or
+            (clusters[0] if clusters else None))
+if _resolve is None:
     st.warning("No clusters available after filtering.")
     st.stop()
-
-selected = st.sidebar.selectbox("Select cluster to inspect", clusters, index=clusters.index(default_cluster) if default_cluster in clusters else 0)
+_target_idx = clusters.index(_resolve) if _resolve in clusters else 0
+selected = st.sidebar.selectbox("Select cluster to inspect", clusters, index=_target_idx)
+if selected != st.session_state.get("cluster_target"):
+    st.session_state["cluster_target"] = selected
 
 cf1, cf2 = st.sidebar.columns(2)
 with cf1:
