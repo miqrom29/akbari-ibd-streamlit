@@ -318,23 +318,61 @@ def parse_akbari_xlsx(raw_bytes: bytes) -> pd.DataFrame:
     """Parse Akbari2026 Supplementary Table 1 XLSX.
     Row 0 = títol taula. Row 1 = noms de columna. Row 2+ = dades."""
     AKBARI_MAP = {
+        # Sample ID
+        "genetic id": "sample_clean",
         "genetic version identifier": "sample_clean",
+        "persistent genetic id": "iid_base",
         "unique individual identifier": "iid_base",
+
+        # Geography
         "political entity": "country",
-        "latitute": "lat",
+        "country": "country",
         "latitude": "lat",
+        "latitute": "lat",
         "longitude": "lon",
-        "date mean in bp": "date_mean_bp",
+        "locality": "locality",
+        "site": "site",
+        "location": "location",
+        "region": "region",
         "broad geographic region": "broad_region",
+
+        # Dates
+        "date mean in bp": "date_mean_bp",
+        "date mean in bp in years before 1950 ce": "date_mean_bp",
+        "full date": "full_date",
+
+        # Haplogroups
+        "y haplogroup in terminal mutation notation": "haplogroup_y",
+        "y haplogroup in isogg notation": "haplogroup_y_isogg",
+        "y haplogroup manually called": "haplogroup_y_manual",
+        "mtdna haplogroup": "haplogroup_mt",
+        "mtdna haplogroup if": "haplogroup_mt",
+
+        # Coverage & Quality
         "mean coverage": "coverage",
+        "mtdna coverage": "mtdna_coverage",
         "data source": "data_source",
+        "publication": "publication",
         "in unrelated set": "unrelated",
-        "publication if some or all": "publication",
+        "molecular sex": "sex",
+        "family relations": "family_relations",
     }
+    try:
+        import openpyxl  # noqa: F401 — assegura que openpyxl és disponible
+    except ImportError:
+        st.error(
+            "❌ **openpyxl** no està instal·lat. "
+            "Afegeix `openpyxl` a `requirements.txt` del teu repositori i reinicia l'app."
+        )
+        return pd.DataFrame()
     try:
         df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=1, dtype=str)
     except Exception:
-        df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+        try:
+            df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+        except Exception as exc:
+            st.warning(f"No s'ha pogut llegir el fitxer XLSX: {exc}")
+            return pd.DataFrame()
     df.columns = [str(c).strip() for c in df.columns]
     rename = {}
     for col in df.columns:
@@ -359,8 +397,17 @@ def parse_akbari_xlsx(raw_bytes: bytes) -> pd.DataFrame:
 
 
 def norm_meta_col(c: str) -> str:
-    c = str(c).strip().replace("\ufeff", "")
+    """Normalitza noms de columna: elimina BOM, salts, espais, parèntesis."""
+    c = str(c).strip()
+    # Elimina BOM, salts de línia, tabulacions
+    c = c.replace("\ufeff", "").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    # Espais múltiples → espai simple
     c = re.sub(r"\s+", " ", c)
+    # Elimina parèntesis i cometes per a matching més robust
+    c = c.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
+    c = c.replace('"', "").replace("'", "")
+    # Normalitza separadors
+    c = re.sub(r"[\s\-/]+", "_", c)
     return c.lower()
 
 
@@ -369,6 +416,8 @@ def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
     un DataFrame indexat per sample_clean."""
     if filename.lower().endswith(".xlsx"):
         return parse_akbari_xlsx(raw_bytes)
+
+    # Detectar separador
     if filename.lower().endswith((".tsv", ".anno", ".txt")):
         sep = "\t"
     else:
@@ -379,9 +428,18 @@ def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
             sep = ";"
         else:
             sep = ","
+
+    # Detectar si header multi-línia (AADR .anno típicament té parèntesis explicatius)
+    # Llegim primera línia per veure si és un header complex
+    first_line = raw_bytes.split(b"\n")[0].decode("utf-8", errors="ignore")
+    skiprows_count = 0
+    if len(first_line) > 200 or "(" in first_line or "suffices" in first_line.lower():
+        # Probablement header multi-línia — saltem 1 fila
+        skiprows_count = 1
+
     try:
         df = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, dtype=str,
-                         on_bad_lines="skip", low_memory=False)
+                         on_bad_lines="skip", low_memory=False, skiprows=skiprows_count)
     except Exception:
         return pd.DataFrame()
     df.columns = [str(c).strip() for c in df.columns]
@@ -406,19 +464,26 @@ def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
 
     mt_col = _find([
         lambda n: n == "haplogroup_mt",
+        lambda n: n == "mtdna_haplogroup",
+        lambda n: "mtdna" in n and "haplogroup" in n,
         lambda n: n == "mt_haplogroup",
-        lambda n: "mtdna haplogroup" in n,
         lambda n: "mitochond" in n and "haplogroup" in n,
     ])
     y_col = _find([
-        lambda n: n in ("haplogroup_y", "y_haplogroup", "snp", "y_snp"),
-        lambda n: "y haplogroup" in n,
+        lambda n: n == "haplogroup_y",
+        lambda n: n == "y_haplogroup_in_isogg_notation",
+        lambda n: n == "y_haplogroup_in_terminal_mutation_notation",
+        lambda n: n == "y_haplogroup_manually_called",
+        lambda n: n in ("y_haplogroup", "snp", "y_snp"),
+        lambda n: "y" in n and "haplogroup" in n and "isogg" not in n,
     ])
     bp_col = _find([
+        lambda n: "date_mean_in_bp" in n,
         lambda n: "date mean in bp" in n,
         lambda n: n in ("date_mean_bp", "st1_date_mean_bp"),
     ])
     br_col = _find([
+        lambda n: "broad_geographic_region" in n,
         lambda n: "broad geographic region" in n,
         lambda n: n == "broad_region",
     ])
@@ -427,14 +492,29 @@ def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
         df[sid_col].astype(str).str.strip()
         .str.replace(r"\s+", "", regex=True).apply(clean_id)
     )
-    if mt_col:
+    if mt_col and mt_col in df.columns:
         df = df.rename(columns={mt_col: "haplogroup_mt"})
     else:
         df["haplogroup_mt"] = pd.NA
+
+    # Prioritat Y: si hi ha terminal notation (preferit), usar-la; sinó ISOGG
     if y_col and y_col in df.columns:
         df = df.rename(columns={y_col: "haplogroup_y"})
+        # Si no hem trobat terminal notation, busca ISOGG com a fallback
+        if y_col.endswith("isogg_notation"):
+            y_isogg = _find([lambda n: "terminal_mutation" in n])
+            if y_isogg and y_isogg in df.columns:
+                df["haplogroup_y"] = df[y_isogg].fillna(df[y_col])
     else:
-        df["haplogroup_y"] = pd.NA
+        # Busca Y ISOGG com a fallback si no hi ha terminal
+        y_isogg = _find([
+            lambda n: "y_haplogroup_in_isogg_notation" in n,
+            lambda n: "y_isogg" in n,
+        ])
+        if y_isogg and y_isogg in df.columns:
+            df = df.rename(columns={y_isogg: "haplogroup_y"})
+        else:
+            df["haplogroup_y"] = pd.NA
     if bp_col and bp_col != "date_mean_bp" and bp_col in df.columns:
         df = df.rename(columns={bp_col: "date_mean_bp"})
     if br_col and br_col != "broad_region" and br_col in df.columns:
