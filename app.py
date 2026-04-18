@@ -410,42 +410,74 @@ def deduplicate_undirected_pairs(df: pd.DataFrame, keep: str = "max") -> pd.Data
 
 def create_id_mapping(ibd_ids: set, meta_ids: set, existing_map: dict = None) -> dict:
     """
-    Crea un mapa manual entre IDs del fitxer IBD i IDs del metadata.
-    Mostra un selector per a cada ID del IBD que no té correspondència directa.
+    Creates a manual mapping between IBD file IDs and metadata IDs.
+    Uses a search-and-assign interface to avoid creating thousands of widgets.
     """
     if existing_map is None:
         existing_map = {}
 
-    # IDs del IBD que no estan al metadata (exactament)
     missing = ibd_ids - meta_ids
     if not missing:
-        st.success("✅ Tots els ID del fitxer IBD ja tenen correspondència exacta al metadata.")
+        st.success("✅ All IBD file IDs already have an exact match in the metadata.")
         return {}
 
-    st.warning(f"⚠️ Hi ha {len(missing)} ID al fitxer IBD que no es troben al metadata exactament. Assigna'ls manualment:")
+    st.warning(f"⚠️ {len(missing)} ID(s) from the IBD file were not found exactly in the metadata.")
 
-    mapping = {}
-    # Mostrem els ID que falten ordenats
-    for ibd_id in sorted(missing):
-        # Valor per defecte: si ja existeix un mapa previ, el mostrem
-        default = existing_map.get(ibd_id, None)
-        # Opcions: buit + llista d'ID del metadata
-        options = ["(Selecciona un ID del metadata)"] + sorted(meta_ids)
-        idx = 0 if default is None else options.index(default) if default in options else 0
-        selected = st.selectbox(
-            f"ID del IBD: **{ibd_id}** → assigna a:",
-            options,
-            index=idx,
-            key=f"map_{ibd_id}"
-        )
-        if selected != "(Selecciona un ID del metadata)":
-            mapping[ibd_id] = selected
+    # Option 1: Upload a CSV mapping file
+    st.markdown("#### 📤 Option 1: Upload a mapping CSV file")
+    st.caption("CSV with two columns: `ibd_id`, `metadata_id` (header required)")
+    mapping_file = st.file_uploader("Upload mapping CSV", type=["csv"], key="mapping_csv")
+    if mapping_file is not None:
+        try:
+            mapping_df = pd.read_csv(mapping_file)
+            if "ibd_id" in mapping_df.columns and "metadata_id" in mapping_df.columns:
+                new_map = dict(zip(mapping_df["ibd_id"], mapping_df["metadata_id"]))
+                # Validate that metadata_id exists
+                valid_map = {k: v for k, v in new_map.items() if v in meta_ids}
+                st.success(f"Loaded {len(valid_map)} mappings from CSV.")
+                return valid_map
+            else:
+                st.error("CSV must contain columns 'ibd_id' and 'metadata_id'")
+        except Exception as e:
+            st.error(f"Error reading CSV: {e}")
 
-    # Botó per confirmar el mapa
-    if st.button("✓ Aplicar aquestes assignacions"):
-        return mapping
-    else:
-        return {}
+    st.markdown("#### 🔍 Option 2: Assign IDs one by one (search and assign)")
+    st.caption("Search for an IBD ID that needs mapping, then select the corresponding metadata ID.")
+
+    # Sort missing IDs for consistent display
+    missing_list = sorted(missing)
+
+    # Create a selectbox for the IBD ID to map (only one at a time)
+    selected_ibd = st.selectbox("Select IBD ID to map:", ["(select)"] + missing_list, key="ibd_to_map")
+
+    if selected_ibd != "(select)":
+        # Search bar for metadata ID
+        meta_search = st.text_input("Search metadata ID (type to filter):", key="meta_search")
+        # Filter metadata IDs based on search
+        filtered_meta = [mid for mid in sorted(meta_ids) if meta_search.lower() in mid.lower()] if meta_search else sorted(meta_ids)[:100]  # Limit to 100 for performance
+        if len(filtered_meta) > 200:
+            st.caption(f"Showing first 200 of {len(filtered_meta)} matches. Refine your search.")
+            filtered_meta = filtered_meta[:200]
+
+        selected_meta = st.selectbox("Select matching metadata ID:", ["(select)"] + filtered_meta, key="meta_to_map")
+
+        if selected_meta != "(select)":
+            if st.button(f"✓ Map '{selected_ibd}' → '{selected_meta}'"):
+                return {selected_ibd: selected_meta}
+
+    # Show current mappings
+    if existing_map:
+        st.markdown("#### 📋 Current mappings")
+        mapping_df = pd.DataFrame(list(existing_map.items()), columns=["IBD ID", "Metadata ID"])
+        st.dataframe(mapping_df, use_container_width=True, height=min(400, len(mapping_df) * 35 + 38))
+
+        if st.button("🗑️ Clear all mappings"):
+            return {}
+        if st.button("📥 Download mappings as CSV"):
+            csv = mapping_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", csv, "id_mappings.csv", "text/csv")
+
+    return {}
 # ==================== FI DE LES FUNCIONS AUXILIARS ====================
 
 
@@ -1130,45 +1162,43 @@ with col_b:
             value=max(40.0, cm_min_global),
             step=1.0,
         )
-# ==================== VINCULACIÓ MANUAL D'ID ====================
+# ==================== MANUAL ID MAPPING ====================
 if meta is not None and df is not None:
-    # Conjunt d'ID del metadata (ja nets amb clean_id)
+    # Set of metadata IDs (already cleaned with clean_id)
     meta_ids = set(meta.index)
-    # Conjunt d'ID del fitxer IBD (sample1 i sample2)
+    # Set of IBD file IDs (sample1 and sample2)
     ibd_ids = set(df["sample1"]).union(set(df["sample2"]))
 
-    # Inicialitzar l'estat de sessió per al mapa
+    # Initialize session state for mapping
     if "id_mapping" not in st.session_state:
         st.session_state["id_mapping"] = {}
 
-    with st.expander("🔗 Vincular ID del IBD amb el metadata (si no coincideixen exactament)"):
+    with st.expander("🔗 Link IBD IDs to metadata (if they don't match exactly)"):
         st.markdown("""
-        **Utilitza aquesta eina si les mostres del teu fitxer IBD tenen noms diferents dels del metadata**
-        (ex: `Loschbour.AG` vs `Loschbour`, majúscules, etc.)
+        **Use this tool if your IBD file samples have different names than the metadata**
+        (e.g., `Loschbour.AG` vs `Loschbour`, uppercase/lowercase differences, etc.)
         """)
+
+        # Check if mapping is needed
+        missing = ibd_ids - meta_ids
+        if missing:
+            st.info(f"ℹ️ {len(missing)} IDs from IBD file are not in metadata. You can map them below.")
+
+        # Call the mapping function
         new_mapping = create_id_mapping(ibd_ids, meta_ids, st.session_state["id_mapping"])
         if new_mapping:
-            # Actualitzem el mapa global
             st.session_state["id_mapping"].update(new_mapping)
-            st.success(f"S'han desat {len(new_mapping)} assignacions. Recarregant...")
+            st.success(f"Saved {len(new_mapping)} mapping(s). Reloading...")
             st.rerun()
 
-        # Mostrar el mapa actual
-        if st.session_state["id_mapping"]:
-            st.markdown("**Assignacions actuals:**")
-            for k, v in st.session_state["id_mapping"].items():
-                st.write(f"`{k}` → `{v}`")
-            if st.button("🗑️ Esborrar totes les assignacions"):
-                st.session_state["id_mapping"] = {}
-                st.rerun()
-
-    # Aplicar el mapa als dataframes de parelles
+    # Apply the mapping to the pairs dataframe
     if st.session_state["id_mapping"]:
         df["sample1"] = df["sample1"].replace(st.session_state["id_mapping"])
         df["sample2"] = df["sample2"].replace(st.session_state["id_mapping"])
-        # També cal actualitzar el conjunt d'ID per si de cas
-        ibd_ids = set(df["sample1"]).union(set(df["sample2"]))
-        st.info(f"S'ha aplicat el mapa d'ID. Ara hi ha {len(ibd_ids.intersection(meta_ids))} coincidències directes.")
+        # Recompute missing after mapping
+        ibd_ids_mapped = set(df["sample1"]).union(set(df["sample2"]))
+        matches = len(ibd_ids_mapped.intersection(meta_ids))
+        st.sidebar.success(f"✅ ID mapping applied. {matches} IBD IDs now match metadata.")
 
 build_df = df[df["total_cM"] >= min_cm_build].copy()
 st.caption(f"Working set after build threshold: {len(build_df):,} pairs out of {len(df):,}")
@@ -1546,4 +1576,5 @@ with right:
 if segments_df is not None:
     st.subheader("Unified segments preview")
     st.dataframe(segments_df.head(200), width="stretch", height=200)
+
 
