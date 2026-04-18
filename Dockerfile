@@ -11,4 +11,4 @@ EXPOSE 10000
 
 HEALTHCHECK CMD curl --fail http://localhost:10000/_stcore/health
 
-ENTRYPOINT ["streamlit", "run", "ibd_app-V15e_fixed.py", "--server.port=10000", "--server.address=0.0.0.0"]
+ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=10000", "--server.address=0.0.0.0"]
