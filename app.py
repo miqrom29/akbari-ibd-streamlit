@@ -67,273 +67,354 @@ def parse_family_relations(fam_str: str) -> Optional[list]:
                 continue
     return relationships if relationships else None
 
-def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Carrega qualsevol fitxer (CSV, TSV, ANNO, XLSX) i permet seleccionar columnes manualment."""
-    # ------------------------------------------------------------
-    # 1. Llegir previsualització per obtenir noms de columna
-    # ------------------------------------------------------------
-    if filename.lower().endswith(".xlsx"):
-        # Llegim només les primeres 100 files de l'XLSX per detectar columnes
-        try:
-            df_preview = pd.read_excel(io.BytesIO(raw_bytes), nrows=100, dtype=str)
-        except Exception:
-            df_preview = pd.DataFrame()
-        if df_preview.empty:
-            return pd.DataFrame()
-        # Per a XLSX, llegirem el complet després
-        df_full = None
-    else:
-        # Detectar separador i salt de línia per a CSV/TSV/ANNO
-        if filename.lower().endswith((".tsv", ".anno", ".txt")):
-            sep = "\t"
+import hashlib  # Assegura't que estigui als imports (al principi del fitxer)
+
+def file_fingerprint(raw_bytes: bytes, filename: str) -> str:
+    h = hashlib.md5()
+    h.update(filename.encode("utf-8", errors="ignore"))
+    h.update(raw_bytes[:200000])
+    h.update(str(len(raw_bytes)).encode())
+    return h.hexdigest()
+
+# ↓↓↓ AFEGEIX AIXÒ ↓↓↓
+def normalize_preview_col(col: str) -> str:
+    col = str(col).replace("\ufeff", " ")
+    col = re.sub(r"\s*\([^)]*\)", "", col)
+    col = re.sub(r"[\n\r\t]+", " ", col)
+    col = re.sub(r"\s+", " ", col).strip().lower()
+    return col
+
+def _load_metadata_file_with_mapping(raw_bytes: bytes, filename: str, state_key: str, curr_map: dict) -> pd.DataFrame:
+    """Carrega el fitxer complet després que l'usuari ha confirmat el mapping."""
+    lower_name = filename.lower()
+
+    try:
+        if lower_name.endswith(".xlsx"):
+            usecols = list(curr_map.values()) if curr_map else None
+            df_full = pd.read_excel(io.BytesIO(raw_bytes), dtype=str, usecols=usecols)
         else:
-            preview_text = raw_bytes[:20000].decode("utf-8", errors="ignore")
-            tab_count = preview_text.count("\t")
-            comma_count = preview_text.count(",")
-            sep = "\t" if tab_count > comma_count else ","
-
-        first_line = raw_bytes.split(b"\n")[0].decode("utf-8", errors="ignore")
-        skiprows_count = 0
-        if len(first_line) > 200 or "(" in first_line or "suffices" in first_line.lower():
-            skiprows_count = 1
-
-        # Previsualització
-        try:
-            if filename.lower().endswith(".anno"):
-                df_preview = pd.read_csv(
-                    io.BytesIO(raw_bytes),
-                    sep="\t",
-                    dtype=str,
-                    nrows=100,
-                    skiprows=0,   # important: no saltar la primera línia (és el header real)
-                    on_bad_lines="skip",
-                    engine="python"
-                )
+            if lower_name.endswith((".anno", ".tsv", ".txt")):
+                sep = "\t"
             else:
-                df_preview = pd.read_csv(
-                    io.BytesIO(raw_bytes),
-                    sep=sep,
-                    dtype=str,
-                    nrows=100,
-                    skiprows=skiprows_count,
-                    on_bad_lines="skip",
-                    low_memory=False
-                )
-        except Exception as e:
-            st.error(f"No s'ha pogut llegir la previsualització de {filename}: {e}")
-            return pd.DataFrame()
+                sep = detect_separator(raw_bytes)
 
-        # Lectura completa (es farà després de l'assignació)
-        df_full = None
+            first_line = raw_bytes.split(b"\n")[0].decode("utf-8", errors="ignore")
+            skiprows = 1 if (len(first_line) > 200 or "suffices" in first_line.lower()) else 0
 
-    # Si no hem pogut llegir la previsualització, sortim
-    if df_preview.empty:
-        return pd.DataFrame()
-
-    # ------------------------------------------------------------
-    # 2. Normalitzar noms de columna per als selectors
-    # ------------------------------------------------------------
-    def normalize_col_name(col: str) -> str:
-        col = re.sub(r'\s*\([^)]*\)', '', col)
-        col = re.sub(r'\s+', ' ', col).strip()
-        words = col.split()[:4]   # 4 paraules per captar "mtDNA haplogroup if"
-        return " ".join(words).lower()
-
-    col_options = {}
-    for col in df_preview.columns:
-        norm = normalize_col_name(col)
-        col_options[norm] = col
-
-    # ------------------------------------------------------------
-    # 3. Gestionar l'estat de sessió per a les assignacions
-    # ------------------------------------------------------------
-    if "metadata_column_mapping" not in st.session_state:
-        st.session_state["metadata_column_mapping"] = {}
-
-    mapping = st.session_state["metadata_column_mapping"]
-
-    # Si l'usuari vol reassignar, li donem un botó per esborrar l'entrada
-    if filename in mapping:
-        if st.sidebar.button(f"🔄 Reassignar columnes per a {filename}"):
-            del mapping[filename]
-            st.rerun()
-        # Si ja està assignat, anem directament a aplicar (evitem mostrar els selectors una altra vegada)
-    else:
-        # Mostrar tots els selectors per a aquest fitxer
-        st.sidebar.markdown(f"### 🧬 Assigna columnes per a `{filename}`")
-        st.sidebar.caption("Selecciona quina columna correspon a cada camp (pots canviar tots abans de confirmar)")
-
-        fields = {
-            "sample_clean": "ID de la mostra (obligatori)",
-            "haplogroup_mt": "Haplogrup mitocondrial",
-            "haplogroup_y": "Haplogrup Y",
-            "date_mean_bp": "Data mitjana en BP",
-            "broad_region": "Regió geogràfica ampla",
-            "country": "País / Political Entity",
-            "locality": "Localitat",
-            "site": "Jaciment",
-            "roh_segments": "Suma ROH >20cM",
-            "family_relations": "Relacions familiars",
-            "group_id": "Grup",
-            "individual_id": "ID individual"
-        }
-
-        keywords = {
-            "sample_clean": ["genetic id", "persistent genetic id", "individual id", "sample"],
-            "haplogroup_mt": ["mtdna haplogroup", "mitochondrial", "mt haplogroup"],
-            "haplogroup_y": ["y haplogroup", "y chromosome"],
-            "date_mean_bp": ["date mean in bp", "date mean bp", "date mean"],
-            "broad_region": ["broad geographic region", "broad region"],
-            "country": ["political entity", "country"],
-            "locality": ["locality"],
-            "site": ["site"],
-            "roh_segments": ["sum total of roh", "roh segments"],
-            "family_relations": ["family relations"],
-            "group_id": ["group id"],
-            "individual_id": ["individual id"]
-        }
-
-        mapping[filename] = {}
-        for field, desc in fields.items():
-            default = None
-            # Cerca per paraules clau
-            for kw in keywords.get(field, []):
-                for norm_name in col_options.keys():
-                    if kw in norm_name:
-                        default = norm_name
-                        break
-                if default:
-                    break
-            options = ["(ignorar)"] + list(col_options.keys())
-            idx = 0 if default is None else options.index(default) + 1
-            selected = st.sidebar.selectbox(
-                desc,
-                options=options,
-                index=idx,
-                key=f"map_{filename}_{field}"
+            usecols = list(curr_map.values()) if curr_map else None
+            df_full = pd.read_csv(
+                io.BytesIO(raw_bytes),
+                sep=sep,
+                dtype=str,
+                skiprows=skiprows,
+                on_bad_lines="skip",
+                usecols=usecols
             )
-            if selected != "(ignorar)":
-                mapping[filename][field] = col_options[selected]
-
-        # Botó per confirmar totes les assignacions
-        if st.sidebar.button(f"✓ Aplicar assignació per a {filename}"):
-            st.rerun()
-        else:
-            # Encara no s'ha confirmat, retornem buit per esperar
-            return pd.DataFrame()
-
-    # ------------------------------------------------------------
-    # 4. Un cop tenim el mapping, llegim el fitxer complet (si no ho havíem fet)
-    # ------------------------------------------------------------
-    if df_full is None:
-        # Tornem a llegir el fitxer sencer amb les mateixes opcions
-        if filename.lower().endswith(".xlsx"):
-            try:
-                df_full = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
-            except Exception as e:
-                st.error(f"Error carregant {filename} complet: {e}")
-                return pd.DataFrame()
-        else:
-            if filename.lower().endswith(".anno"):
-                try:
-                    df_full = pd.read_csv(
-                        io.BytesIO(raw_bytes),
-                        sep="\t",
-                        dtype=str,
-                        skiprows=0,
-                        on_bad_lines="skip",
-                        engine="python"
-                    )
-                except Exception as e:
-                    st.error(f"Error carregant {filename} complet: {e}")
-                    return pd.DataFrame()
-            elif sep == "\t":
-                df_full = pd.read_csv(
-                    io.BytesIO(raw_bytes),
-                    sep=sep,
-                    dtype=str,
-                    skiprows=skiprows_count,
-                    on_bad_lines="skip",
-                    low_memory=False
-                )
-            else:
-                df_full = pd.read_csv(
-                    io.BytesIO(raw_bytes),
-                    sep=sep,
-                    dtype=str,
-                    skiprows=skiprows_count,
-                    on_bad_lines="skip",
-                    engine="python"
-                )
+    except Exception as e:
+        st.error(f"Error loading {filename}: {e}")
+        return pd.DataFrame()
 
     if df_full.empty:
         return pd.DataFrame()
 
-    # ------------------------------------------------------------
-    # 5. Aplicar el mapping al df_full
-    # ------------------------------------------------------------
-    curr_map = mapping.get(filename, {})
-    if not curr_map.get("sample_clean"):
-        st.error(f"No s'ha assignat cap columna d'ID per a {filename}")
+    sample_col = curr_map.get("sample_clean")
+    if not sample_col or sample_col not in df_full.columns:
+        st.error(f"Sample column '{sample_col}' not found in {filename}")
         return pd.DataFrame()
 
-    df_full["sample_clean"] = (
-        df_full[curr_map["sample_clean"]].astype(str).str.strip()
-        .str.replace(r"\s+", "", regex=True).apply(clean_id)
+    out = pd.DataFrame()
+    out["sample_clean"] = df_full[sample_col].astype(str).str.strip().apply(clean_id)
+
+    for field in ["haplogroup_mt", "haplogroup_y", "broad_region", "country", "locality", "site"]:
+        src = curr_map.get(field)
+        out[field] = df_full[src] if src and src in df_full.columns else pd.NA
+
+    src = curr_map.get("date_mean_bp")
+    out["date_mean_bp"] = pd.to_numeric(df_full[src], errors="coerce") if src and src in df_full.columns else pd.NA
+
+    src = curr_map.get("roh_segments")
+    out["roh_segments"] = pd.to_numeric(df_full[src], errors="coerce") if src and src in df_full.columns else pd.NA
+
+    src = curr_map.get("family_relations")
+    if src and src in df_full.columns:
+        out["family_relations"] = df_full[src].apply(parse_family_relations)
+    else:
+        out["family_relations"] = pd.NA
+
+    out = out.dropna(subset=["sample_clean"]).drop_duplicates(subset=["sample_clean"], keep="first")
+    return out.set_index("sample_clean")
+
+def canonicalize_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Assegura que totes les columnes necessàries existeixen al dataframe."""
+    out = df.copy()
+    required_cols = [
+        "sample_clean", "haplogroup_mt", "haplogroup_y", "date_mean_bp",
+        "broad_region", "country", "locality", "site", "roh_segments",
+        "family_relations", "group_id", "individual_id"
+    ]
+    for col in required_cols:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out
+
+def find_first_col(cols, predicates):
+    for raw_col in cols:
+        n = norm_meta_col(raw_col)
+        for p in predicates:
+            if p(n):
+                return raw_col
+    return None
+
+def load_metadata_csv_simple(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    text_preview = raw_bytes[:20000].decode("utf-8", errors="ignore")
+
+    if filename.lower().endswith(".tsv"):
+        sep = "\t"
+    elif "\t" in text_preview and text_preview.count("\t") > text_preview.count(","):
+        sep = "\t"
+    elif ";" in text_preview and text_preview.count(";") > text_preview.count(","):
+        sep = ";"
+    else:
+        sep = ","
+
+    try:
+        header_df = pd.read_csv(
+            io.BytesIO(raw_bytes),
+            sep=sep,
+            dtype=str,
+            nrows=0,
+            on_bad_lines="skip"
+        )
+    except Exception as exc:
+        st.error(f"Could not read metadata header from {filename}: {exc}")
+        return pd.DataFrame()
+
+    header_cols = [str(c).strip() for c in header_df.columns]
+    if not header_cols:
+        return pd.DataFrame()
+
+    sid_col = find_first_col(header_cols, [
+        lambda n: n == "sample",
+        lambda n: n == "iid",
+        lambda n: n == "#iid",
+        lambda n: n == "individual id",
+        lambda n: n == "individual_id",
+        lambda n: n == "id",
+        lambda n: n.startswith("individual id"),
+        lambda n: "genetic id" in n,
+        lambda n: "sample id" in n,
+        lambda n: "individual id" in n,
+    ]) or header_cols[0]
+
+    mt_col = find_first_col(header_cols, [
+        lambda n: n == "haplogroup_mt",
+        lambda n: n == "mt_haplogroup",
+        lambda n: "mtdna haplogroup" in n,
+        lambda n: n.startswith("mtdna haplogroup"),
+        lambda n: "mitochond" in n and "haplogroup" in n,
+    ])
+
+    y_col = find_first_col(header_cols, [
+        lambda n: n == "haplogroup_y",
+        lambda n: n == "y_haplogroup",
+        lambda n: n == "snp",
+        lambda n: n == "y_snp",
+        lambda n: n.startswith("y haplogroup"),
+        lambda n: "y haplogroup" in n,
+        lambda n: "ychr" in n and "haplogroup" in n,
+        lambda n: n == "tree",
+    ])
+
+    bp_col = find_first_col(header_cols, [
+        lambda n: "date mean in bp" in n,
+        lambda n: n == "date_mean_bp",
+        lambda n: "years before 1950" in n,
+        lambda n: n == "st1_date_mean_bp",
+    ])
+
+    br_col = find_first_col(header_cols, [
+        lambda n: "broad geographic region" in n,
+        lambda n: n == "broad_region",
+        lambda n: n == "region",
+    ])
+
+    extra_candidates = [
+        "country", "site", "culture", "full_date", "location", "region",
+        "Closest cluster", "closest pop", "closest sample", "distance", "F_MISS", "N_MISS",
+        "cluster_id", "cluster_size", "ID_core", "st1_uid", "date_source"
+    ]
+
+    wanted_cols = [sid_col]
+    for col in [mt_col, y_col, bp_col, br_col]:
+        if col is not None and col not in wanted_cols:
+            wanted_cols.append(col)
+
+    for col in extra_candidates:
+        if col in header_cols and col not in wanted_cols:
+            wanted_cols.append(col)
+
+    try:
+        meta = pd.read_csv(
+            io.BytesIO(raw_bytes),
+            sep=sep,
+            dtype=str,
+            usecols=wanted_cols,
+            on_bad_lines="skip",
+            low_memory=False,
+        )
+    except Exception as exc:
+        st.error(f"Could not read metadata file {filename}: {exc}")
+        return pd.DataFrame()
+
+    meta.columns = [str(c).strip() for c in meta.columns]
+
+    meta["sample_clean"] = (
+        meta[sid_col]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", "", regex=True)
+        .apply(clean_id)
     )
 
-    for field in ["haplogroup_mt", "haplogroup_y", "date_mean_bp", "broad_region",
-                  "country", "locality", "roh_segments", "family_relations",
-                  "group_id", "individual_id", "site"]:
-        if field not in df_full.columns:
-            df_full[field] = pd.NA
+    if mt_col is not None and mt_col in meta.columns:
+        meta.rename(columns={mt_col: "haplogroup_mt"}, inplace=True)
+    elif "haplogroup_mt" not in meta.columns:
+        meta["haplogroup_mt"] = pd.NA
 
-    if "haplogroup_mt" in curr_map:
-        df_full["haplogroup_mt"] = df_full[curr_map["haplogroup_mt"]]
-    if "haplogroup_y" in curr_map:
-        df_full["haplogroup_y"] = df_full[curr_map["haplogroup_y"]]
-    if "date_mean_bp" in curr_map:
-        df_full["date_mean_bp"] = pd.to_numeric(df_full[curr_map["date_mean_bp"]], errors="coerce")
-    if "broad_region" in curr_map:
-        df_full["broad_region"] = df_full[curr_map["broad_region"]]
-    if "country" in curr_map:
-        df_full["country"] = df_full[curr_map["country"]]
-    if "locality" in curr_map:
-        df_full["locality"] = df_full[curr_map["locality"]]
-    if "roh_segments" in curr_map:
-        df_full["roh_segments"] = pd.to_numeric(df_full[curr_map["roh_segments"]], errors="coerce")
-    if "family_relations" in curr_map:
-        df_full["family_relations"] = df_full[curr_map["family_relations"]].apply(parse_family_relations)
-    if "group_id" in curr_map:
-        df_full["group_id"] = df_full[curr_map["group_id"]]
-    if "individual_id" in curr_map:
-        df_full["individual_id"] = df_full[curr_map["individual_id"]]
-    if "site" in curr_map:
-        df_full["site"] = df_full[curr_map["site"]]
+    if y_col is not None and y_col in meta.columns:
+        meta.rename(columns={y_col: "haplogroup_y"}, inplace=True)
+    elif "haplogroup_y" not in meta.columns:
+        meta["haplogroup_y"] = pd.NA
+
+    if bp_col is not None and bp_col in meta.columns and bp_col != "date_mean_bp":
+        meta.rename(columns={bp_col: "date_mean_bp"}, inplace=True)
+    elif "date_mean_bp" not in meta.columns:
+        meta["date_mean_bp"] = pd.NA
+
+    if br_col is not None and br_col in meta.columns and br_col != "broad_region":
+        meta.rename(columns={br_col: "broad_region"}, inplace=True)
+    elif "broad_region" not in meta.columns:
+        meta["broad_region"] = pd.NA
 
     for c in ["haplogroup_mt", "haplogroup_y"]:
-        if c in df_full.columns:
-            df_full[c] = df_full[c].replace(
-                {"nan": pd.NA, "None": pd.NA, "": pd.NA, ".": pd.NA,
-                 "..": pd.NA, "n/a": pd.NA, "NA": pd.NA}
-            )
-            df_full[c] = df_full[c].astype("string")
+        meta[c] = meta[c].replace(r"^\s*$", pd.NA, regex=True)
+        meta[c] = meta[c].replace({
+            "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA,
+            ".": pd.NA, "..": pd.NA, "n/a": pd.NA, "NA": pd.NA,
+        })
+        meta[c] = meta[c].astype("string")
 
-    df_full = df_full.dropna(subset=["sample_clean"]).drop_duplicates(subset=["sample_clean"], keep="first")
-    return df_full.set_index("sample_clean")
+    if "date_mean_bp" in meta.columns:
+        meta["date_mean_bp"] = pd.to_numeric(meta["date_mean_bp"], errors="coerce")
 
-def merge_meta_frames(frames: list) -> pd.DataFrame:
-    if not frames:
+    meta = meta.dropna(subset=["sample_clean"]).drop_duplicates(subset=["sample_clean"], keep="first")
+    return meta.set_index("sample_clean")
+
+
+
+def load_metadata_anno_advanced(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Per AADR .anno: lectura robusta amb detecció automàtica"""
+    try:
+        meta = pd.read_csv(
+            io.BytesIO(raw_bytes),
+            sep="\t",
+            dtype=str,
+            skiprows=0,
+            on_bad_lines="skip",
+            engine="python",
+        )
+    except Exception as exc:
+        st.error(f"Could not read ANNO metadata {filename}: {exc}")
         return pd.DataFrame()
-    combined = frames[0]
-    for other in frames[1:]:
-        try:
-            combined = combined.combine_first(other)
-        except Exception:
-            pass
-    return combined
+
+    if meta.empty:
+        return pd.DataFrame()
+
+    meta.columns = [str(c).strip() for c in meta.columns]
+
+    # Detecció de columnes
+    def find_col(*patterns):
+        for col in meta.columns:
+            n = norm_meta_col(col)
+            if any(p in n for p in patterns):
+                return col
+        return None
+
+    sid_col = find_col("iid", "sample", "genetic id", "individual id") or meta.columns[0]
+    mt_col = find_col("mtdna haplogroup", "mitochondrial")
+    y_col = find_col("y haplogroup", "y chromosome")
+    bp_col = find_col("date mean in bp", "date_mean_bp")
+    br_col = find_col("broad region", "broad geographic")
+    fam_col = find_col("family relations", "kinship")
+    site_col = find_col("site")
+    country_col = find_col("political entity", "country")
+    locality_col = find_col("locality")
+
+    out = pd.DataFrame()
+    out["sample_clean"] = meta[sid_col].astype(str).str.strip().str.replace(r"\s+", "", regex=True).apply(clean_id)
+    out["haplogroup_mt"] = meta[mt_col] if mt_col else pd.NA
+    out["haplogroup_y"] = meta[y_col] if y_col else pd.NA
+    out["date_mean_bp"] = pd.to_numeric(meta[bp_col], errors="coerce") if bp_col else pd.NA
+    out["broad_region"] = meta[br_col] if br_col else pd.NA
+    out["family_relations"] = meta[fam_col].apply(parse_family_relations) if fam_col else pd.NA
+    out["site"] = meta[site_col] if site_col else pd.NA
+    out["country"] = meta[country_col] if country_col else pd.NA
+    out["locality"] = meta[locality_col] if locality_col else pd.NA
+
+    out = out.dropna(subset=["sample_clean"]).drop_duplicates(subset=["sample_clean"], keep="first")
+    return out.set_index("sample_clean")
+
+
+def load_metadata_xlsx_advanced(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Per XLSX: intenta detectar si és Akbari o el converteix a CSV"""
+    lower = filename.lower()
+
+    # Si és Akbari, utilitzar el parser específic
+    if "akbari" in lower:
+        return parse_akbari_xlsx(raw_bytes)
+
+    # Altres XLSX: convertir a CSV i usar el loader simple
+    try:
+        df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str, engine="openpyxl")
+    except Exception as exc:
+        st.error(f"Could not read XLSX metadata {filename}: {exc}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    csv_like = io.BytesIO(df.to_csv(index=False).encode("utf-8"))
+    return load_metadata_csv_simple(csv_like.getvalue(), filename.replace(".xlsx", ".csv"))
+
+
+def load_metadata_file(raw_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Router principal: tria el loader segons l'extensió"""
+    lower = filename.lower()
+    if lower.endswith(".anno"):
+        return load_metadata_anno_advanced(raw_bytes, filename)
+    if lower.endswith(".xlsx"):
+        return load_metadata_xlsx_advanced(raw_bytes, filename)
+    # CSV, TSV, TXT
+    return load_metadata_csv_simple(raw_bytes, filename)
 
 # ==================== FUNCIONS AUXILIARS PER A L'APP ====================
+def merge_meta_frames(frames: list) -> pd.DataFrame:
+    """Fusiona múltiples DataFrames de metadata indexats per sample_clean."""
+    if not frames:
+        return pd.DataFrame()
+    combined = frames[0].copy()
+    for other in frames[1:]:
+        if other is None or other.empty:
+            continue
+        # Assegurar que totes les columnes existeixin als dos DataFrames
+        for col in other.columns:
+            if col not in combined.columns:
+                combined[col] = pd.NA
+        for col in combined.columns:
+            if col not in other.columns:
+                other[col] = pd.NA
+        combined = combined.combine_first(other)
+    return combined
 
 def classify_relationship(total_cm: float) -> str:
     if total_cm >= 2500:
@@ -589,7 +670,7 @@ def parse_ancibd_block_tsv(raw_bytes: bytes, source: str) -> pd.DataFrame:
 
     return pd.DataFrame(pairs, columns=["sample1", "sample2", "total_cM", "source_file", "platform"])
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Multi-CSV parsers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Multi-CSV parsers ”””””””””””””””””””””””””
 
 def _empty_segs() -> pd.DataFrame:
     return pd.DataFrame(columns=["id1", "id2", "chrom", "start", "end", "cM", "snps", "platform", "source_file"])
@@ -748,139 +829,84 @@ def detect_and_parse(file, focal_sample):
     return pd.DataFrame(columns=["id1", "id2", "total_cM", "platform", "source_file"]), _empty_segs(), "Unknown/unsupported (yet)"
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Akbari 2026 XLSX + multi-metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
+#  Akbari 2026 XLSX + multi-metadata
 def parse_akbari_xlsx(raw_bytes: bytes) -> pd.DataFrame:
-    """Parse Akbari2026 Supplementary Table 1 XLSX.
-    Row 0 = tÃ­tol taula. Row 1 = noms de columna. Row 2+ = dades."""
-    AKBARI_MAP = {
-        # Sample ID
-        "genetic id": "sample_clean",
+    akbari_map = {
         "genetic version identifier": "sample_clean",
+        "genetic id": "sample_clean",
         "persistent genetic id": "iid_base",
-        "unique individual identifier": "iid_base",
-
-        # Geography
+        "unique individual identifier": "individual_id",
         "political entity": "country",
         "country": "country",
-        "latitude": "lat",
-        "latitute": "lat",
-        "longitude": "lon",
         "locality": "locality",
         "site": "site",
         "location": "location",
         "region": "region",
         "broad geographic region": "broad_region",
-
-        # Dates
         "date mean in bp": "date_mean_bp",
         "date mean in bp in years before 1950 ce": "date_mean_bp",
         "full date": "full_date",
-
-        # Haplogroups
         "y haplogroup in terminal mutation notation": "haplogroup_y",
-        "y haplogroup in isogg notation": "haplogroup_y_isogg",
         "y haplogroup manually called": "haplogroup_y_manual",
-        "mtdna haplogroup": "haplogroup_mt",
+        "y haplogroup in isogg notation": "haplogroup_y_isogg",
         "mtdna haplogroup if": "haplogroup_mt",
-
-        # Coverage & Quality
+        "mtdna haplogroup": "haplogroup_mt",
         "mean coverage": "coverage",
         "mtdna coverage": "mtdna_coverage",
-        "data source": "data_source",
-        "publication": "publication",
-        "in unrelated set": "unrelated",
         "molecular sex": "sex",
         "family relations": "family_relations",
+        "publication": "publication",
+        "data source": "data_source",
+        "latitude": "lat",
+        "longitude": "lon",
     }
+
     try:
-        import openpyxl  # noqa: F401 â€” assegura que openpyxl Ã©s disponible
-    except ImportError:
-        st.error(
-            "âŒ **openpyxl** no estÃ  instalÂ·lat. "
-            "Afegeix `openpyxl` a `requirements.txt` del teu repositori i reinicia l'app."
-        )
-        return pd.DataFrame()
-    try:
-        df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=1, dtype=str)
+        df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=1, dtype=str, engine="openpyxl")
     except Exception:
         try:
-            df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+            df = pd.read_excel(io.BytesIO(raw_bytes), dtype=str, engine="openpyxl")
         except Exception as exc:
-            st.warning(f"No s'ha pogut llegir el fitxer XLSX: {exc}")
+            st.error(f"Could not read Akbari XLSX: {exc}")
             return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
     df.columns = [str(c).strip() for c in df.columns]
+
     rename = {}
+    used_targets = set()
     for col in df.columns:
-        cl = col.lower()
-        for pattern, target in AKBARI_MAP.items():
-            if pattern in cl and target not in rename.values():
+        col_norm = normalize_preview_col(col)
+        for pattern, target in akbari_map.items():
+            if pattern in col_norm and target not in used_targets:
                 rename[col] = target
+                used_targets.add(target)
                 break
+
     df = df.rename(columns=rename)
-    if "sample_clean" not in df.columns and "iid_base" in df.columns:
-        df["sample_clean"] = df["iid_base"].astype(str).str.strip().apply(clean_id)
-    elif "sample_clean" in df.columns:
-        df["sample_clean"] = df["sample_clean"].astype(str).str.strip().apply(clean_id)
-    else:
-        df["sample_clean"] = df.iloc[:, 0].astype(str).str.strip().apply(clean_id)
-    for c in ["date_mean_bp", "lat", "lon", "coverage"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["sample_clean"])
-    df = df[df["sample_clean"].str.match(r"[A-Za-z0-9]")].copy()
+
+    if "sample_clean" not in df.columns:
+        if "iid_base" in df.columns:
+            df["sample_clean"] = df["iid_base"]
+        else:
+            df["sample_clean"] = df.iloc[:, 0]
+
+    df["sample_clean"] = df["sample_clean"].astype(str).str.strip().apply(clean_id)
+
+    for num_col in ["date_mean_bp", "coverage", "mtdna_coverage", "lat", "lon"]:
+        if num_col in df.columns:
+            df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
+
+    if "family_relations" in df.columns:
+        df["family_relations"] = df["family_relations"].apply(parse_family_relations)
+
+    df = canonicalize_metadata_columns(df)
+    df = df.dropna(subset=["sample_clean"]).drop_duplicates(subset=["sample_clean"], keep="first")
     return df.set_index("sample_clean")
 
-
-
-
-def parse_family_relations(fam_str: str) -> Optional[list]:
-    """Parseja family relations AADR anno.
-    Format: "1.0d daughter-mother:AV1:AV2,1.0d brothers:CL145:CL146"
-    """
-    if not fam_str or pd.isna(fam_str):
-        return None
-    relationships = []
-    for rel_pair in str(fam_str).split(","):
-        parts = rel_pair.split(":")
-        if len(parts) >= 3:
-            try:
-                degree = float(parts[0].rstrip("d").strip()) if parts[0] else None
-                relationship = parts[1].strip() if len(parts) > 1 else "unknown"
-                id1 = parts[2].strip() if len(parts) > 2 else None
-                id2 = parts[3].strip() if len(parts) > 3 else None
-                if id1 and id2:
-                    relationships.append({
-                        "degree": degree,
-                        "relationship": relationship,
-                        "id1": id1,
-                        "id2": id2
-                    })
-            except (ValueError, IndexError):
-                continue
-    return relationships if relationships else None
-
-def norm_meta_col(c: str) -> str:
-    """Normalitza columnes â€” RESTAURAT (no existia a v12b)"""
-    c = str(c).strip().replace("\\ufeff", "")
-    c = re.sub(r"\\s+", " ", c)
-    return c.lower()
-
-
-def merge_meta_frames(frames: list) -> pd.DataFrame:
-    """Fusiona llista de DataFrames indexats per sample_clean.
-    Primer fitxer tÃ© prioritat; combine_first omple els buits."""
-    if not frames:
-        return pd.DataFrame()
-    combined = frames[0]
-    for other in frames[1:]:
-        try:
-            combined = combined.combine_first(other)
-        except Exception:
-            pass
-    return combined
-
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Cached builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Cached builders ”””””””””””””””””””””””””
 
 @st.cache_data(show_spinner=False)
 def build_pairs_from_ancibd(raw_bytes: bytes, filename: str) -> pd.DataFrame:
@@ -1025,7 +1051,7 @@ def build_cluster_summary(df_small: pd.DataFrame, cluster_map: dict):
     summary["node_count"] = summary["cluster"].map(lambda c: len(nodes_per_cluster.get(c, set())))
     return summary.sort_values(["node_count", "pair_count", "max_cM"], ascending=False)
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Session state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#  Session state
 
 if "favorites" not in st.session_state:
     st.session_state["favorites"] = set()
@@ -1033,8 +1059,9 @@ if "pedigree_notes" not in st.session_state:
     st.session_state["pedigree_notes"] = ""
 if "cluster_target" not in st.session_state:
     st.session_state["cluster_target"] = None
-
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Sidebar inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+if "metadata_file_fingerprints" not in st.session_state:
+    st.session_state["metadata_file_fingerprints"] = {}
+# Sidebar inputs
 
 st.sidebar.header("Input mode")
 input_mode = st.sidebar.radio("Choose input source", [
@@ -1044,37 +1071,52 @@ input_mode = st.sidebar.radio("Choose input source", [
 ], index=1)
 st.sidebar.header("Optional sample metadata")
 meta_files = st.sidebar.file_uploader(
-    "Metadata files â€” CSV / TSV / AADR .anno / Akbari XLSX",
+    "Metadata files ” CSV / TSV / AADR .anno / Akbari XLSX",
     type=["csv", "tsv", "anno", "txt", "xlsx"],
     accept_multiple_files=True,
     key="meta",
 )
-
 meta = None
 if meta_files:
-    _meta_frames = []
-    for _mf in meta_files:
-        _raw = _mf.getvalue()
-        _df = load_metadata_file(_raw, _mf.name)
-        if not _df.empty:
-            _meta_frames.append(_df)
-            st.sidebar.caption(f"✓ {_mf.name}: {len(_df):,} rows")
-    if _meta_frames:
-        meta = merge_meta_frames(_meta_frames)
+    meta_frames = []
+    pending_mapping = False
+
+    for mf in meta_files:
+        raw = mf.getvalue()
+        df_meta = load_metadata_file(raw, mf.name)
+        if df_meta.empty:
+            # Pot ser que estigui pendent de mapping
+            lower_name = mf.name.lower()
+            if not (lower_name.endswith(".xlsx") and "akbari" in lower_name):
+                pending_mapping = True
+            continue
+        meta_frames.append(df_meta)
+        st.sidebar.caption(f"✓ {mf.name}: {len(df_meta):,} rows")
+
+    if pending_mapping and not meta_frames:
+        st.sidebar.info("Complete metadata column mapping and click Apply mapping.")
+
+    if meta_frames:
+        meta = merge_meta_frames(meta_frames)
         st.sidebar.caption(f"Metadata merged: {len(meta):,} total rows")
+
+        # 🔍 DIAGNÒSTIC TEMPORAL - Mostra les columnes detectades
+        st.sidebar.markdown("**Columnes detectades al metadata:**")
+        st.sidebar.write(list(meta.columns))
+         # Fi del diagnòstic
+
         _mt_ok = meta["haplogroup_mt"].notna().sum() if "haplogroup_mt" in meta.columns else 0
         _y_ok  = meta["haplogroup_y"].notna().sum()  if "haplogroup_y"  in meta.columns else 0
         _bp_ok = meta["date_mean_bp"].notna().sum()  if "date_mean_bp"  in meta.columns else 0
         _br_ok = meta["broad_region"].notna().sum()  if "broad_region"  in meta.columns else 0
-        # NOUS:
         _fam_ok = meta["family_relations"].notna().sum() if "family_relations" in meta.columns else 0
         _roh_ok = meta["roh_segments"].notna().sum() if "roh_segments" in meta.columns else 0
-        st.sidebar.caption(f"mt non-null: {_mt_ok:,} | Y non-null: {_y_ok:,}")
+        st.sidebar.caption(f"mt: {_mt_ok:,} | Y: {_y_ok:,}")
         if _bp_ok or _br_ok:
-            st.sidebar.caption(f"BP non-null: {_bp_ok:,} | broad_region non-null: {_br_ok:,}")
-        # NOUS:
+            st.sidebar.caption(f"BP: {_bp_ok:,} | region: {_br_ok:,}")
         if _fam_ok or _roh_ok:
-            st.sidebar.caption(f"🔗 family_relations non-null: {_fam_ok:,} | ROH segments non-null: {_roh_ok:,}")
+            st.sidebar.caption(f"🔗 family: {_fam_ok:,} | ROH: {_roh_ok:,}")
+
 
 # Data loading
 
@@ -1137,7 +1179,7 @@ else:
         file_name="unified_pairs.csv", mime="text/csv",
     )
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Optional threshold before graph build â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Optional threshold before graph build ”””””””””””””””””””””””””
 
 df["relationship_class"] = df["total_cM"].apply(classify_relationship)
 
@@ -1239,7 +1281,7 @@ cluster_summary = build_cluster_summary(build_df[["sample1", "sample2", "total_c
 st.subheader("Cluster summary")
 st.dataframe(cluster_summary.head(500), width="stretch", height=260)
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Temporal distribution chart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Temporal distribution chart ”””””””””””””””””””””””””
 
 if "date_mean_bp" in df_samples.columns and df_samples["date_mean_bp"].notna().any():
     st.subheader("Temporal distribution by cluster")
@@ -1277,8 +1319,8 @@ if "date_mean_bp" in df_samples.columns and df_samples["date_mean_bp"].notna().a
                 showlegend=True,
             ))
         fig_time.update_layout(
-            title="Date mean BP distribution â€” top 20 clusters",
-            xaxis_title="Date mean (years BP, older â†’ left)",
+            title="Date mean BP distribution ” top 20 clusters",
+            xaxis_title="Date mean (years BP, older †’ left)",
             xaxis=dict(autorange="reversed"),
             yaxis_title="Cluster",
             height=max(350, len(_top_clusters) * 32),
@@ -1292,7 +1334,7 @@ if meta is not None and not df_samples.empty:
     matched = df_samples["sample"].astype(str).apply(clean_id).isin(meta.index).sum()
     st.caption(f"Metadata matched to {matched} / {len(df_samples)} samples in current graph")
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Sidebar cluster controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Sidebar cluster controls ”””””””””””””””””””””””””
 
 st.sidebar.header("Cluster selection")
 clusters = cluster_summary["cluster"].tolist()
@@ -1378,7 +1420,7 @@ if st.session_state["favorites"]:
         st.sidebar.write(f"- {c}")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Sidebar: Geography & Culture filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Sidebar: Geography & Culture filters ”””””””””””””””””””””””””
 
 st.sidebar.header("Geography & Culture filters")
 
@@ -1407,13 +1449,13 @@ def apply_geo_filters(df_s: pd.DataFrame) -> pd.DataFrame:
         out = out[out["country"].isin(filter_country)]
     return out
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Selected cluster only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ””””””””””””””””””””””””” Selected cluster only ”””””””””””””””””””””””””
 
 selected_nodes = [n for n, c in cluster_map.items() if c == selected]
 selected_pairs = build_df[build_df["sample1"].isin(selected_nodes) & build_df["sample2"].isin(selected_nodes)].copy()
 selected_samples = apply_geo_filters(df_samples[df_samples["cluster"] == selected].copy())
 if filter_br or filter_cult or filter_country:
-    st.caption(f"âš‘ Geo filter active â€” {len(selected_samples)} of {(df_samples['cluster'] == selected).sum()} samples shown")
+    st.caption(f"š‘ Geo filter active ” {len(selected_samples)} of {(df_samples['cluster'] == selected).sum()} samples shown")
 
 left, right = st.columns([1.05, 1.15])
 with left:
@@ -1422,7 +1464,7 @@ with left:
     # Export CSV del cluster
     _csv_bytes = selected_samples.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="â¬‡ Download cluster CSV",
+        label="¬‡ Download cluster CSV",
         data=_csv_bytes,
         file_name=f"{selected.replace(' ', '_')}_samples.csv",
         mime="text/csv",
@@ -1570,7 +1612,7 @@ with right:
                     name=str(_rv),
                     showlegend=True,
                 ))
-            fig.update_layout(title=f"IBD network â€” {selected}", xaxis=dict(visible=False), yaxis=dict(visible=False), showlegend=True, legend=dict(title="Broad region", itemsizing="constant", orientation="v", x=1.01, y=1), height=700, margin=dict(l=10, r=160, t=50, b=10))
+            fig.update_layout(title=f"IBD network ” {selected}", xaxis=dict(visible=False), yaxis=dict(visible=False), showlegend=True, legend=dict(title="Broad region", itemsizing="constant", orientation="v", x=1.01, y=1), height=700, margin=dict(l=10, r=160, t=50, b=10))
             st.plotly_chart(fig, width="stretch")
 
 if segments_df is not None:
