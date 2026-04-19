@@ -1351,7 +1351,7 @@ if search_id and not df_samples.empty:
     st.sidebar.write(f"{len(hits)} samples matched." if len(hits) else "No samples matched.")
 
     if cluster_from_id:
-        if st.sidebar.button("ðŸ” Load cluster (ID search)", key="load_id"):
+        if st.sidebar.button(" Load cluster (ID search)", key="load_id"):
             st.session_state["cluster_target"] = cluster_from_id
             st.rerun()
 cluster_from_hg = None
@@ -1392,7 +1392,7 @@ if meta is not None and not df_samples.empty:
                     )
 
                 if cluster_from_hg:
-                    if st.sidebar.button("ðŸ” Load cluster (haplogroup search)", key="load_hg"):
+                    if st.sidebar.button(" Load cluster (haplogroup search)", key="load_hg"):
                         st.session_state["cluster_target"] = cluster_from_hg
                         st.rerun()
 # Resolem cluster a mostrar: botÃ³ de cerca > search > primer cluster
@@ -1455,7 +1455,7 @@ selected_nodes = [n for n, c in cluster_map.items() if c == selected]
 selected_pairs = build_df[build_df["sample1"].isin(selected_nodes) & build_df["sample2"].isin(selected_nodes)].copy()
 selected_samples = apply_geo_filters(df_samples[df_samples["cluster"] == selected].copy())
 if filter_br or filter_cult or filter_country:
-    st.caption(f"š‘ Geo filter active ” {len(selected_samples)} of {(df_samples['cluster'] == selected).sum()} samples shown")
+    st.caption(f" Geo filter active ” {len(selected_samples)} of {(df_samples['cluster'] == selected).sum()} samples shown")
 
 left, right = st.columns([1.05, 1.15])
 with left:
@@ -1464,7 +1464,7 @@ with left:
     # Export CSV del cluster
     _csv_bytes = selected_samples.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="¬‡ Download cluster CSV",
+        label=" Download cluster CSV",
         data=_csv_bytes,
         file_name=f"{selected.replace(' ', '_')}_samples.csv",
         mime="text/csv",
@@ -1472,28 +1472,96 @@ with left:
     )
 
     st.subheader("Pedigree notes console")
-    sample_choices = selected_samples["sample"].tolist()
-    sel_note = st.selectbox("Select sample to append", sample_choices if sample_choices else [""], key="sample_to_add_notes")
-    n1, n2, n3 = st.columns(3)
-    with n1:
-        if st.button("Add sample") and sample_choices:
-            row = selected_samples[selected_samples["sample"] == sel_note].iloc[0]
-            line = make_note_line(row)
-            if line not in st.session_state["pedigree_notes"]:
+
+# Funció millorada per generar notes
+def make_note_line(row: pd.Series) -> str:
+    def safe(v):
+        if pd.isna(v) or str(v).strip() == "":
+            return "NA"
+        return str(v).strip()
+
+    sample = safe(row.get("sample"))
+    mt = safe(row.get("haplogroup_mt"))
+    y = safe(row.get("haplogroup_y"))
+    site = safe(row.get("site"))
+    # Prioritzar broad_region sobre region
+    region = safe(row.get("region"))
+    if region == "NA":
+        region = safe(row.get("broad_region"))
+    country = safe(row.get("country"))
+    bp = safe(row.get("date_mean_bp"))
+    cluster = safe(row.get("cluster"))
+
+    return f"{sample} | mt={mt} | Y={y} | site={site} | region={region} | country={country} | BP={bp} | {cluster}"
+
+sample_choices = selected_samples["sample"].tolist() if not selected_samples.empty else []
+sel_note = st.selectbox("Select sample to append", sample_choices if sample_choices else [""], key="sample_to_add_notes")
+
+n1, n2, n3, n4 = st.columns(4)
+with n1:
+    if st.button("➕ Add sample") and sample_choices:
+        row = selected_samples[selected_samples["sample"] == sel_note].iloc[0]
+        line = make_note_line(row)
+        if line not in st.session_state["pedigree_notes"]:
+            st.session_state["pedigree_notes"] += line + "\n"
+with n2:
+    if st.button("📋 Add cluster") and not selected_samples.empty:
+        existing = set(filter(None, st.session_state["pedigree_notes"].splitlines()))
+        for _, r in selected_samples.iterrows():
+            line = make_note_line(r)
+            if line not in existing:
                 st.session_state["pedigree_notes"] += line + "\n"
-    with n2:
-        if st.button("Add cluster") and not selected_samples.empty:
-            existing = set(filter(None, st.session_state["pedigree_notes"].splitlines()))
-            for _, r in selected_samples.iterrows():
-                line = make_note_line(r)
-                if line not in existing:
-                    st.session_state["pedigree_notes"] += line + "\n"
-                    existing.add(line)
-    with n3:
-        if st.button("Clear notes"):
-            st.session_state["pedigree_notes"] = ""
-    st.text_area("Notes", key="pedigree_notes", height=180)
-    st.download_button("Download notes.txt", st.session_state["pedigree_notes"].encode("utf-8"), file_name="pedigree_notes.txt", mime="text/plain")
+                existing.add(line)
+with n3:
+    if st.button("🔄 Replace cluster") and not selected_samples.empty:
+        lines = [make_note_line(r) for _, r in selected_samples.iterrows()]
+        st.session_state["pedigree_notes"] = "\n".join(lines)
+with n4:
+    if st.button("🗑️ Clear notes"):
+        st.session_state["pedigree_notes"] = ""
+
+# Editor de notes separat del session_state per evitar sobrescritures
+edited_notes = st.text_area(
+    "Notes",
+    value=st.session_state["pedigree_notes"],
+    height=220,
+    key="pedigree_notes_editor",
+    help="You can edit this text manually. Changes are saved automatically."
+)
+
+if edited_notes != st.session_state["pedigree_notes"]:
+    st.session_state["pedigree_notes"] = edited_notes
+
+# Previsualització del text abans de descarregar
+if not selected_samples.empty:
+    preview_lines = [make_note_line(r) for _, r in selected_samples.iterrows()]
+    with st.expander("📄 Preview cluster notes text", expanded=False):
+        st.text_area("Preview (read only)", value="\n".join(preview_lines), height=180, key="preview_cluster_notes")
+
+# Diagnòstic temporal
+st.write(f"Debug: notes length = {len(st.session_state.get('pedigree_notes', ''))}")
+st.write(f"Debug: notes content = {repr(st.session_state.get('pedigree_notes', ''))}")
+
+# Botons de descàrrega
+col_dl1, col_dl2 = st.columns(2)
+with col_dl1:
+    st.download_button(
+        "💾 Download notes.txt",
+        st.session_state["pedigree_notes"].encode("utf-8"),
+        file_name="pedigree_notes.txt",
+        mime="text/plain",
+        key="dl_notes_txt"
+    )
+with col_dl2:
+    if not selected_samples.empty:
+        cluster_notes_text = "\n".join(make_note_line(r) for _, r in selected_samples.iterrows())
+        st.download_button(
+            "📥 Download cluster notes.txt",
+            cluster_notes_text.encode("utf-8"),
+            file_name=f"{selected.replace(' ', '_')}_notes.txt",
+            mime="text/plain",
+            key="dl_cluster_notes_txt"
+        )
 
 with right:
     st.subheader(f"Pairwise relationships in {selected}")
